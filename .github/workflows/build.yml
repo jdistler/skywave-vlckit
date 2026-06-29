@@ -1,0 +1,95 @@
+name: Build VLCKit xcframework
+
+# Builds VLCKit.xcframework (which compiles libVLC from source with the patches in
+# libvlc/patches/) on a macOS runner and publishes it as a release asset that the
+# skywave-vlckit-spm Package.swift consumes via binaryTarget.
+#
+# PUBLIC repo => macOS Actions minutes are free. Manual dispatch only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to publish the xcframework under"
+        required: true
+        default: "baseline-1"
+      verbose:
+        description: "Verbose libVLC build (-v)"
+        required: false
+        default: "true"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Toolchain info
+        run: |
+          set -x
+          sw_vers
+          xcodebuild -version
+          ls /Applications | grep -i xcode || true
+          which python3 && python3 --version || true
+          which swift && swift --version || true
+          df -h /
+
+      # Contribs (ffmpeg, etc.) are the long pole and do NOT depend on our libVLC
+      # source patch, so cache the whole vlc checkout (contribs live untracked inside
+      # it; the build script git-resets the tracked source + re-applies patches each run).
+      - name: Cache libvlc/vlc (contribs + tools)
+        uses: actions/cache@v4
+        with:
+          path: libvlc/vlc
+          key: vlc-${{ runner.os }}-85a537d69-${{ hashFiles('libvlc/patches/*contrib*', 'libvlc/patches/0001*', 'libvlc/patches/0002*', 'libvlc/patches/0007*', 'libvlc/patches/0009*', 'libvlc/patches/0011*') }}
+          restore-keys: |
+            vlc-${{ runner.os }}-85a537d69-
+
+      - name: Build VLCKit (device + simulator)
+        run: |
+          set -o pipefail
+          VFLAG=""
+          if [ "${{ github.event.inputs.verbose }}" = "true" ]; then VFLAG="-v"; fi
+          ./compileAndBuildVLCKit.sh -f $VFLAG
+
+      - name: Locate + package xcframework
+        id: pkg
+        run: |
+          set -e
+          find . -maxdepth 3 -name "VLCKit.xcframework" -print
+          cd iOS
+          /usr/bin/zip -ry VLCKit.xcframework.zip VLCKit.xcframework
+          SHA=$(shasum -a 256 VLCKit.xcframework.zip | awk '{print $1}')
+          echo "checksum=$SHA" >> "$GITHUB_OUTPUT"
+          echo "$SHA  VLCKit.xcframework.zip" | tee checksum.txt
+          ls -la VLCKit.xcframework.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VLCKit-xcframework-${{ github.event.inputs.release_tag }}
+          path: |
+            iOS/VLCKit.xcframework.zip
+            iOS/checksum.txt
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTES="VLCKit.xcframework built from $(git rev-parse --short HEAD).
+          SPM binaryTarget checksum: ${{ steps.pkg.outputs.checksum }}"
+          if gh release view "${{ github.event.inputs.release_tag }}" >/dev/null 2>&1; then
+            gh release upload "${{ github.event.inputs.release_tag }}" iOS/VLCKit.xcframework.zip --clobber
+          else
+            gh release create "${{ github.event.inputs.release_tag }}" \
+              iOS/VLCKit.xcframework.zip \
+              --title "${{ github.event.inputs.release_tag }}" \
+              --notes "$NOTES"
+          fi
+          echo "::notice title=binaryTarget checksum::${{ steps.pkg.outputs.checksum }}"
