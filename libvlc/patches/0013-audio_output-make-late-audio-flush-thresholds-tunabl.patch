@@ -1,0 +1,150 @@
+From 940dda4ad7630ef42a4f5f26f00c319ae9e85a46 Mon Sep 17 00:00:00 2001
+From: jdistler <josephcd921@gmail.com>
+Date: Mon, 29 Jun 2026 17:17:26 -0500
+Subject: [PATCH] audio_output: make late-audio flush thresholds tunable
+
+stream_HandleDrift() flushes the audio output whenever the render is "too
+late": beyond 3*AOUT_MAX_PTS_DELAY once playing, or beyond 0 (i.e. any
+lateness at all) before the first buffer of a freshly (re)started stream has
+played. The latter is harmless for a continuous source, but on segmented HLS
+where the decoder/aout is restarted at segment boundaries it fans a flush
+loop: each restart leaves sync.played=false, so a late first buffer is
+flushed, the next first buffer is again late, and so on, starving the demux
+via es_out backpressure until playback freezes. This reproduces on iOS
+(audiounit) where the output reports a ~140 ms steady-state lateness that
+desktop outputs do not.
+
+Expose two config options, plumbed from the decoder (which inherits per-input
+options) through vlc_aout_stream_cfg into the stream sync state:
+
+  audio-late-tolerance   (ms, default 180) - the "way too late" flush
+                         threshold once playing.
+  audio-resync-tolerance (ms, default 0)   - lateness tolerated right after a
+                         (re)start, before the first buffer has played.
+
+Both defaults reproduce the previous hardcoded behaviour exactly, so this is a
+no-op unless the options are set. Raising audio-resync-tolerance lets a moderate
+post-restart drift be absorbed by the resampler instead of flush-looping.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ src/audio_output/aout_internal.h |  7 +++++++
+ src/audio_output/dec.c           | 13 ++++++++++++-
+ src/input/decoder.c              |  8 ++++++++
+ src/libvlc-module.c              | 18 ++++++++++++++++++
+ 4 files changed, 45 insertions(+), 1 deletion(-)
+
+diff --git a/src/audio_output/aout_internal.h b/src/audio_output/aout_internal.h
+index 0ba059464b..8d9e8dfba9 100644
+--- a/src/audio_output/aout_internal.h
++++ b/src/audio_output/aout_internal.h
+@@ -160,6 +160,13 @@ struct vlc_aout_stream_cfg
+     struct vlc_clock_t *clock;
+     const char *str_id;
+     const audio_replay_gain_t *replay_gain;
++    /* Skywave: tunable audio drift tolerances (ticks). <=0 means "use upstream
++     * default". late_tolerance = "way too late" flush threshold once playing;
++     * resync_tolerance = lateness tolerated right after a (re)start before the
++     * first buffer has played (upstream hardcodes 0, which fans a flush loop on
++     * iOS segmented HLS after each per-segment decoder restart). */
++    vlc_tick_t late_tolerance;
++    vlc_tick_t resync_tolerance;
+ };
+ 
+ vlc_aout_stream *vlc_aout_stream_New(audio_output_t *p_aout,
+diff --git a/src/audio_output/dec.c b/src/audio_output/dec.c
+index 6243296c02..31228a7b92 100644
+--- a/src/audio_output/dec.c
++++ b/src/audio_output/dec.c
+@@ -68,6 +68,10 @@ struct vlc_aout_stream
+         bool played;
+         vlc_tick_t request_delay;
+         vlc_tick_t delay;
++        /* Skywave: tunable lateness thresholds (ticks) used by
++         * stream_HandleDrift(); see vlc_aout_stream_cfg. */
++        vlc_tick_t late_tolerance;
++        vlc_tick_t resync_tolerance;
+     } sync;
+ 
+     struct
+@@ -400,6 +404,12 @@ vlc_aout_stream * vlc_aout_stream_New(audio_output_t *p_aout,
+     stream->sync.rate = 1.f;
+     stream->sync.resamp_type = AOUT_RESAMPLING_NONE;
+     stream->sync.delay = stream->sync.request_delay = 0;
++    /* Skywave: latch the tunable lateness thresholds (fall back to upstream
++     * behaviour: 3x AOUT_MAX_PTS_DELAY flush threshold, 0 post-restart). */
++    stream->sync.late_tolerance = cfg->late_tolerance > 0 ?
++        cfg->late_tolerance : 3 * AOUT_MAX_PTS_DELAY;
++    stream->sync.resync_tolerance = cfg->resync_tolerance > 0 ?
++        cfg->resync_tolerance : 0;
+ 
+     stream->discontinuity.draining = false;
+     stream_ResetTimings(stream);
+@@ -631,7 +641,8 @@ static void stream_HandleDrift(vlc_aout_stream *stream, vlc_tick_t drift,
+      * where supported. The other alternative is to flush the buffers
+      * completely. */
+     if (drift > (stream->sync.played ?
+-                 lroundf(+3 * AOUT_MAX_PTS_DELAY / rate) : 0))
++                 lroundf((float)stream->sync.late_tolerance / rate) :
++                 lroundf((float)stream->sync.resync_tolerance / rate)))
+     {
+         if (tracer != NULL)
+             vlc_tracer_TraceEvent(tracer, "RENDER", stream->str_id, "late_flush");
+diff --git a/src/input/decoder.c b/src/input/decoder.c
+index 64edcf7699..272ee2aec2 100644
+--- a/src/input/decoder.c
++++ b/src/input/decoder.c
+@@ -687,6 +687,14 @@ static int ModuleThread_UpdateAudioFormat( decoder_t *p_dec )
+                 .clock = p_owner->p_clock,
+                 .str_id = p_owner->psz_id,
+                 .replay_gain = &p_dec->fmt_out.audio_replay_gain,
++                /* Skywave: tunable audio drift tolerances. Read here (the decoder
++                 * inherits per-input options) and plumbed to the aout stream,
++                 * which itself is parented to the player and would not inherit
++                 * per-media ":audio-*-tolerance" options on its own. */
++                .late_tolerance =
++                    VLC_TICK_FROM_MS(var_InheritInteger(p_dec, "audio-late-tolerance")),
++                .resync_tolerance =
++                    VLC_TICK_FROM_MS(var_InheritInteger(p_dec, "audio-resync-tolerance")),
+             };
+             p_astream = vlc_aout_stream_New( p_aout, &cfg );
+             if( p_astream == NULL )
+diff --git a/src/libvlc-module.c b/src/libvlc-module.c
+index 7af1aa8ac2..4279d1891b 100644
+--- a/src/libvlc-module.c
++++ b/src/libvlc-module.c
+@@ -176,6 +176,18 @@ static const char *ppsz_roles_text[] = {
+     "This delays the audio output. The delay must be given in milliseconds. " \
+     "This can be handy if you notice a lag between the video and the audio.")
+ 
++#define AUDIO_LATE_TOL_TEXT N_("Audio late-flush tolerance (ms)")
++#define AUDIO_LATE_TOL_LONGTEXT N_( \
++    "Maximum audio lateness (in milliseconds) tolerated before the audio output " \
++    "buffers are flushed to resynchronize. Higher values let the resampler absorb " \
++    "larger drifts instead of flushing. Default 180 (3x the 60ms render delay).")
++#define AUDIO_RESYNC_TOL_TEXT N_("Audio post-restart late tolerance (ms)")
++#define AUDIO_RESYNC_TOL_LONGTEXT N_( \
++    "Lateness (in milliseconds) tolerated right after the audio output (re)starts, " \
++    "before the first buffer has played. Upstream uses 0, i.e. any lateness flushes; " \
++    "raising it avoids flush loops when a decoder restart (e.g. per-segment HLS) " \
++    "delivers a late first buffer. Default 0 (unchanged).")
++
+ #define AUDIO_RESAMPLER_TEXT N_("Audio resampler")
+ #define AUDIO_RESAMPLER_LONGTEXT N_( \
+     "This selects which plugin to use for audio resampling." )
+@@ -1624,6 +1636,12 @@ vlc_module_begin ()
+     add_integer( "audio-desync", 0, DESYNC_TEXT,
+                  DESYNC_LONGTEXT )
+         change_safe ()
++    add_integer( "audio-late-tolerance", 180, AUDIO_LATE_TOL_TEXT,
++                 AUDIO_LATE_TOL_LONGTEXT )
++        change_safe ()
++    add_integer( "audio-resync-tolerance", 0, AUDIO_RESYNC_TOL_TEXT,
++                 AUDIO_RESYNC_TOL_LONGTEXT )
++        change_safe ()
+ 
+     set_section( N_("Replay gain") , NULL )
+     add_string( "audio-replay-gain-mode", ppsz_replay_gain_mode[0], AUDIO_REPLAY_GAIN_MODE_TEXT,
+-- 
+2.43.0
+

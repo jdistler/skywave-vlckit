@@ -62,7 +62,7 @@ jobs:
         run: |
           set -e
           find . -maxdepth 3 -name "VLCKit.xcframework" -print
-          cd iOS
+          cd build/iOS
           /usr/bin/zip -ry VLCKit.xcframework.zip VLCKit.xcframework
           SHA=$(shasum -a 256 VLCKit.xcframework.zip | awk '{print $1}')
           echo "checksum=$SHA" >> "$GITHUB_OUTPUT"
@@ -74,8 +74,8 @@ jobs:
         with:
           name: VLCKit-xcframework-${{ github.event.inputs.release_tag }}
           path: |
-            iOS/VLCKit.xcframework.zip
-            iOS/checksum.txt
+            build/build/iOS/VLCKit.xcframework.zip
+            build/iOS/checksum.txt
           if-no-files-found: error
 
       - name: Publish release
@@ -85,10 +85,10 @@ jobs:
           NOTES="VLCKit.xcframework built from $(git rev-parse --short HEAD).
           SPM binaryTarget checksum: ${{ steps.pkg.outputs.checksum }}"
           if gh release view "${{ github.event.inputs.release_tag }}" >/dev/null 2>&1; then
-            gh release upload "${{ github.event.inputs.release_tag }}" iOS/VLCKit.xcframework.zip --clobber
+            gh release upload "${{ github.event.inputs.release_tag }}" build/iOS/VLCKit.xcframework.zip --clobber
           else
             gh release create "${{ github.event.inputs.release_tag }}" \
-              iOS/VLCKit.xcframework.zip \
+              build/iOS/VLCKit.xcframework.zip \
               --title "${{ github.event.inputs.release_tag }}" \
               --notes "$NOTES"
           fi
