@@ -1,0 +1,224 @@
+From 6cf1388355152c131355afe8b0da4ffb806e51ff Mon Sep 17 00:00:00 2001
+From: jdistler <josephcd921@gmail.com>
+Date: Tue, 30 Jun 2026 09:40:28 -0500
+Subject: [PATCH 15/15] demux: adaptive: force monotonic segment timeline
+ (adaptive-ts-force-playlist)
+
+Restream HLS panels often emit inconsistent per-segment PTS: the live-edge
+segment carries broadcast wall-clock PTS while later segments reset toward 0,
+so the demux timeline jumps backward at segment boundaries. On iOS this stalls
+the clock (frames read as minutes/hours "too late") -> ~10s freeze every
+segment -> watchdog reconnect. VLC's existing per-segment continuity
+(SynchronizationReference) handles this on desktop but not for these panels on
+iOS. This is the documented "PTS restart after HLS discontinuity" problem.
+
+Add adaptive-ts-force-playlist: FakeESOut maintains ONE shared offset mapping
+the demux timestamps onto a strictly monotonic output timeline, re-anchoring
+whenever the input DTS jumps (backward, or forward past 1s). The same offset is
+applied to every ES (dts/pts) and to PCR, so A/V and the clock stay in lockstep
+across the discontinuity. Off by default; opt-in per stream.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ modules/demux/adaptive/Streams.cpp            |  2 +
+ modules/demux/adaptive/adaptive.cpp           | 11 +++
+ modules/demux/adaptive/plumbing/FakeESOut.cpp | 78 ++++++++++++++++---
+ modules/demux/adaptive/plumbing/FakeESOut.hpp | 13 ++++
+ 4 files changed, 95 insertions(+), 9 deletions(-)
+
+diff --git a/modules/demux/adaptive/Streams.cpp b/modules/demux/adaptive/Streams.cpp
+index 35eba79989..3415bce02a 100644
+--- a/modules/demux/adaptive/Streams.cpp
++++ b/modules/demux/adaptive/Streams.cpp
+@@ -86,6 +86,8 @@ bool AbstractStream::init(const StreamFormat &format_, SegmentTracker *tracker)
+                 fakeesout->setExtraInfoProvider( this );
+                 fakeesout->setKeepRawTimestamps(
+                     var_InheritBool(p_realdemux, "adaptive-ts-keep-raw") );
++                fakeesout->setForcePlaylistTimestamps(
++                    var_InheritBool(p_realdemux, "adaptive-ts-force-playlist") );
+                 const Role & streamRole = tracker->getStreamRole();
+                 if(streamRole.isDefault() && streamRole.autoSelectable())
+                     fakeesout->setPriority(ES_PRIORITY_MIN + 10);
+diff --git a/modules/demux/adaptive/adaptive.cpp b/modules/demux/adaptive/adaptive.cpp
+index e81074f4f0..5df0008469 100644
+--- a/modules/demux/adaptive/adaptive.cpp
++++ b/modules/demux/adaptive/adaptive.cpp
+@@ -93,6 +93,15 @@ static void Close   (vlc_object_t *);
+     "so passing them through gives one clean timeline. Off by default (upstream behaviour); " \
+     "enable for such non-conformant streams.")
+ 
++#define ADAPT_TSFORCEPL_TEXT N_("Force a monotonic segment timeline")
++#define ADAPT_TSFORCEPL_LONGTEXT N_( \
++    "Force a single, always-increasing output timeline regardless of the segments' internal " \
++    "PTS. A shared offset (applied identically to every ES and to PCR, so A/V stay in lockstep) " \
++    "is re-anchored whenever the demux timestamps jump — backward, or forward past a 1s gap — " \
++    "so a per-segment PTS reset or a broadcast-time first segment can't produce a backward jump " \
++    "that stalls the clock. Off by default; enable for restream HLS panels whose segment PTS " \
++    "are inconsistent and which otherwise freeze at segment boundaries.")
++
+ static const AbstractAdaptationLogic::LogicType pi_logics[] = {
+                                 AbstractAdaptationLogic::LogicType::Default,
+                                 AbstractAdaptationLogic::LogicType::Predictive,
+@@ -154,6 +163,8 @@ vlc_module_begin ()
+             change_integer_list(rgi_latency, ppsz_latency)
+         add_bool   ( "adaptive-ts-keep-raw", false, ADAPT_TSKEEPRAW_TEXT, ADAPT_TSKEEPRAW_LONGTEXT )
+             change_safe ()
++        add_bool   ( "adaptive-ts-force-playlist", false, ADAPT_TSFORCEPL_TEXT, ADAPT_TSFORCEPL_LONGTEXT )
++            change_safe ()
+         set_callbacks( Open, Close )
+ vlc_module_end ()
+ 
+diff --git a/modules/demux/adaptive/plumbing/FakeESOut.cpp b/modules/demux/adaptive/plumbing/FakeESOut.cpp
+index 397504a0b5..0bade391fa 100644
+--- a/modules/demux/adaptive/plumbing/FakeESOut.cpp
++++ b/modules/demux/adaptive/plumbing/FakeESOut.cpp
+@@ -509,7 +509,7 @@ vlc_tick_t FakeESOut::fixTimestamp(vlc_tick_t ts)
+          * b_keep_raw is set, ignore the (inconsistent) mapping entirely: the underlying raw
+          * broadcast PTS are continuous and A/V-aligned, so passing them through unchanged yields a
+          * single clean timeline. Opt-in via "adaptive-ts-keep-raw"; off preserves stock behaviour. */
+-        if(b_keep_raw)
++        if(b_keep_raw || b_force_playlist)
+             return ts;
+ 
+         if(associated.b_timestamp_set)
+@@ -584,6 +584,44 @@ vlc_tick_t FakeESOut::applyTimestampContinuity(vlc_tick_t ts)
+     return ts;
+ }
+ 
++/* Force a single monotonic output timeline. A shared offset maps the (possibly
++ * chaotic) demux timestamps onto a continuous timeline; when the input DTS jumps
++ * — backward, or forward past FP_DISCONTINUITY — we treat it as a segment-boundary
++ * PTS reset and re-anchor so the output simply continues from where it left off.
++ * The SAME offset is applied to every ES (dts/pts) and to PCR, so A/V and the clock
++ * stay in lockstep across the discontinuity. reanchor==true only for the DTS that
++ * drives the timeline (one per block); pts/pcr ride the current offset (reanchor=false). */
++vlc_tick_t FakeESOut::forceContinuity(vlc_tick_t ts, bool reanchor)
++{
++    constexpr vlc_tick_t FP_DISCONTINUITY = VLC_TICK_FROM_MS(1000);
++    if(ts == VLC_TICK_INVALID)
++        return ts;
++    if(!fp_have_ref)
++    {
++        /* First timestamp: anchor to the playlist media start if known, else to itself
++         * (a 0-based output is fine — for live we only care about monotonicity). */
++        vlc_tick_t base = (startTimes.media != VLC_TICK_INVALID) ? startTimes.media : ts;
++        fp_offset = base - ts;
++        fp_have_ref = true;
++        fp_last_out = ts + fp_offset;
++        return fp_last_out;
++    }
++    if(reanchor && fp_last_out != VLC_TICK_INVALID)
++    {
++        vlc_tick_t cand = ts + fp_offset;
++        if(cand < fp_last_out || cand - fp_last_out > FP_DISCONTINUITY)
++        {
++            /* Segment-boundary PTS reset: continue the output right after the last
++             * frame so the clock never jumps. (gap 0 => non-decreasing.) */
++            fp_offset = fp_last_out - ts;
++        }
++    }
++    vlc_tick_t out = ts + fp_offset;
++    if(reanchor && (fp_last_out == VLC_TICK_INVALID || out > fp_last_out))
++        fp_last_out = out;
++    return out;
++}
++
+ void FakeESOut::declareEs(const es_format_t *fmt)
+ {
+     /* Declared ES are only visible until stream data flows.
+@@ -651,16 +689,34 @@ int FakeESOut::esOutSend(es_out_id_t *p_es, block_t *p_block)
+     p_block->i_dts = fixTimestamp( p_block->i_dts );
+     p_block->i_pts = fixTimestamp( p_block->i_pts );
+ 
+-    if(!hasSynchronizationReference() && p_block->i_dts != VLC_TICK_INVALID)
++    if(b_force_playlist)
+     {
+-        synchronizationReference.second.segment = startTimes;
+-        synchronizationReference.second.continuous = p_block->i_dts;
+-        synchronizationReference.second.segment.demux = p_block->i_dts;
+-        assert(hasSynchronizationReference());
++        /* Force a monotonic timeline (DTS drives the re-anchor; PTS rides the same
++         * offset). Establish the sync reference once so the downstream times/PCR math
++         * keeps working — but anchor it to the FORCED output, not the raw demux ts. */
++        const bool firstref = !fp_have_ref;
++        p_block->i_dts = forceContinuity( p_block->i_dts, true );
++        p_block->i_pts = forceContinuity( p_block->i_pts, false );
++        if(firstref && p_block->i_dts != VLC_TICK_INVALID && !hasSynchronizationReference())
++        {
++            synchronizationReference.second.segment = startTimes;
++            synchronizationReference.second.continuous = p_block->i_dts;
++            synchronizationReference.second.segment.demux = p_block->i_dts;
++        }
+     }
++    else
++    {
++        if(!hasSynchronizationReference() && p_block->i_dts != VLC_TICK_INVALID)
++        {
++            synchronizationReference.second.segment = startTimes;
++            synchronizationReference.second.continuous = p_block->i_dts;
++            synchronizationReference.second.segment.demux = p_block->i_dts;
++            assert(hasSynchronizationReference());
++        }
+ 
+-    p_block->i_dts = applyTimestampContinuity( p_block->i_dts );
+-    p_block->i_pts = applyTimestampContinuity( p_block->i_pts );
++        p_block->i_dts = applyTimestampContinuity( p_block->i_dts );
++        p_block->i_pts = applyTimestampContinuity( p_block->i_pts );
++    }
+ 
+     SegmentTimes times;
+     if(p_block->i_dts != VLC_TICK_INVALID)
+@@ -720,7 +776,11 @@ int FakeESOut::esOutControl(int i_query, va_list args)
+             {
+                 pcr = fixTimestamp( pcr );
+ 
+-                pcr = applyTimestampContinuity( pcr );
++                /* Force mode: PCR rides the same shared offset as the ES data (no
++                 * re-anchor on PCR — the ES DTS drives that), so the clock reference
++                 * tracks the forced monotonic timeline instead of the raw PCR. */
++                pcr = b_force_playlist ? forceContinuity( pcr, false )
++                                       : applyTimestampContinuity( pcr );
+ 
+                 times = synchronizationReference.second.segment;
+                 times.offsetBy(pcr - times.demux);
+diff --git a/modules/demux/adaptive/plumbing/FakeESOut.hpp b/modules/demux/adaptive/plumbing/FakeESOut.hpp
+index a3b9fb6847..6768b9d3b9 100644
+--- a/modules/demux/adaptive/plumbing/FakeESOut.hpp
++++ b/modules/demux/adaptive/plumbing/FakeESOut.hpp
+@@ -97,6 +97,13 @@ namespace adaptive
+              * stream whose origin tags only some segments doesn't flip between two
+              * timeline bases. See "adaptive-ts-keep-raw". */
+             void setKeepRawTimestamps( bool b ) { b_keep_raw = b; }
++            /* When true, force a single monotonic output timeline regardless of the
++             * segments' internal PTS: a shared offset is re-anchored whenever the
++             * demux DTS jumps (backward, or forward past a gap threshold), so a
++             * per-segment PTS reset / broadcast-time first segment can't produce a
++             * backward jump that freezes the clock. Applied identically to every ES
++             * and to PCR, so A/V stay in lockstep. See "adaptive-ts-force-playlist". */
++            void setForcePlaylistTimestamps( bool b ) { b_force_playlist = b; }
+             size_t esCount() const;
+             bool hasSelectedEs() const;
+             bool hasSelectedEs(const AbstractFakeESOutID *) const;
+@@ -104,6 +111,7 @@ namespace adaptive
+             void setExtraInfoProvider( ExtraFMTInfoInterface * );
+             vlc_tick_t fixTimestamp(vlc_tick_t);
+             vlc_tick_t applyTimestampContinuity(vlc_tick_t);
++            vlc_tick_t forceContinuity(vlc_tick_t, bool reanchor);
+             void declareEs( const es_format_t * );
+ 
+             void milestoneReached() override;
+@@ -150,6 +158,11 @@ namespace adaptive
+             } associated, expected;
+             vlc_tick_t timestamps_offset;
+             bool b_keep_raw = false;
++            /* force-playlist (monotonic) timeline state — see setForcePlaylistTimestamps */
++            bool b_force_playlist = false;
++            bool fp_have_ref = false;
++            vlc_tick_t fp_offset = 0;
++            vlc_tick_t fp_last_out = VLC_TICK_INVALID;
+             int priority;
+             bool b_in_commands_group;
+             enum class PcrStatus
+-- 
+2.43.0
+

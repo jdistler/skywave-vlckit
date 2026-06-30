@@ -1,7 +1,7 @@
 From 820b0e51c045dc13ca18ea3944bfa7caf6333936 Mon Sep 17 00:00:00 2001
 From: jdistler <josephcd921@gmail.com>
 Date: Mon, 29 Jun 2026 17:17:26 -0500
-Subject: [PATCH 13/14] audio_output: make late-audio flush thresholds tunable
+Subject: [PATCH 13/15] audio_output: make late-audio flush thresholds tunable
 
 stream_HandleDrift() flushes the audio output whenever the render is "too
 late": beyond 3*AOUT_MAX_PTS_DELAY once playing, or beyond 0 (i.e. any
