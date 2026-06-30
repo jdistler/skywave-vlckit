@@ -1,4 +1,4 @@
-From 6cf1388355152c131355afe8b0da4ffb806e51ff Mon Sep 17 00:00:00 2001
+From 2c2fb99330a599d1569bf8a5c98684f494bd34d3 Mon Sep 17 00:00:00 2001
 From: jdistler <josephcd921@gmail.com>
 Date: Tue, 30 Jun 2026 09:40:28 -0500
 Subject: [PATCH 15/15] demux: adaptive: force monotonic segment timeline
@@ -22,9 +22,9 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 ---
  modules/demux/adaptive/Streams.cpp            |  2 +
  modules/demux/adaptive/adaptive.cpp           | 11 +++
- modules/demux/adaptive/plumbing/FakeESOut.cpp | 78 ++++++++++++++++---
- modules/demux/adaptive/plumbing/FakeESOut.hpp | 13 ++++
- 4 files changed, 95 insertions(+), 9 deletions(-)
+ modules/demux/adaptive/plumbing/FakeESOut.cpp | 86 +++++++++++++++++--
+ modules/demux/adaptive/plumbing/FakeESOut.hpp | 13 +++
+ 4 files changed, 103 insertions(+), 9 deletions(-)
 
 diff --git a/modules/demux/adaptive/Streams.cpp b/modules/demux/adaptive/Streams.cpp
 index 35eba79989..3415bce02a 100644
@@ -69,7 +69,7 @@ index e81074f4f0..5df0008469 100644
  vlc_module_end ()
  
 diff --git a/modules/demux/adaptive/plumbing/FakeESOut.cpp b/modules/demux/adaptive/plumbing/FakeESOut.cpp
-index 397504a0b5..0bade391fa 100644
+index 397504a0b5..bf93978b8d 100644
 --- a/modules/demux/adaptive/plumbing/FakeESOut.cpp
 +++ b/modules/demux/adaptive/plumbing/FakeESOut.cpp
 @@ -509,7 +509,7 @@ vlc_tick_t FakeESOut::fixTimestamp(vlc_tick_t ts)
@@ -81,17 +81,24 @@ index 397504a0b5..0bade391fa 100644
              return ts;
  
          if(associated.b_timestamp_set)
-@@ -584,6 +584,44 @@ vlc_tick_t FakeESOut::applyTimestampContinuity(vlc_tick_t ts)
+@@ -584,6 +584,51 @@ vlc_tick_t FakeESOut::applyTimestampContinuity(vlc_tick_t ts)
      return ts;
  }
  
 +/* Force a single monotonic output timeline. A shared offset maps the (possibly
-+ * chaotic) demux timestamps onto a continuous timeline; when the input DTS jumps
-+ * — backward, or forward past FP_DISCONTINUITY — we treat it as a segment-boundary
++ * chaotic) demux timestamps onto a continuous timeline; when the input jumps —
++ * backward, or forward past FP_DISCONTINUITY — we treat it as a segment-boundary
 + * PTS reset and re-anchor so the output simply continues from where it left off.
-+ * The SAME offset is applied to every ES (dts/pts) and to PCR, so A/V and the clock
-+ * stay in lockstep across the discontinuity. reanchor==true only for the DTS that
-+ * drives the timeline (one per block); pts/pcr ride the current offset (reanchor=false). */
++ *
++ * The PCR DRIVES the re-anchor (reanchor==true), NOT the ES data. The PCR is the
++ * program clock and in an MPEG-TS it LEADS the ES data, so re-anchoring on it sets
++ * the new segment's offset before any video/audio frame of that segment is emitted.
++ * Every ES (dts/pts) then rides that SAME offset (reanchor==false) → A/V stay locked
++ * AND the clock never lurches. (The earlier version re-anchored on the ES DTS while
++ * the PCR merely followed; because the PCR arrives first, it was emitted with the
++ * stale offset → an ~800ms backward clock jump every segment → late-picture drops
++ * and audio cut-out.) fp_last_out is the high-water-mark of the output and advances
++ * on EVERY timestamp (PCR + all ES) so the continuation point is always correct. */
 +vlc_tick_t FakeESOut::forceContinuity(vlc_tick_t ts, bool reanchor)
 +{
 +    constexpr vlc_tick_t FP_DISCONTINUITY = VLC_TICK_FROM_MS(1000);
@@ -107,7 +114,7 @@ index 397504a0b5..0bade391fa 100644
 +        fp_last_out = ts + fp_offset;
 +        return fp_last_out;
 +    }
-+    if(reanchor && fp_last_out != VLC_TICK_INVALID)
++    if(reanchor)
 +    {
 +        vlc_tick_t cand = ts + fp_offset;
 +        if(cand < fp_last_out || cand - fp_last_out > FP_DISCONTINUITY)
@@ -118,7 +125,7 @@ index 397504a0b5..0bade391fa 100644
 +        }
 +    }
 +    vlc_tick_t out = ts + fp_offset;
-+    if(reanchor && (fp_last_out == VLC_TICK_INVALID || out > fp_last_out))
++    if(out > fp_last_out)        /* high-water-mark advances on every PCR + ES timestamp */
 +        fp_last_out = out;
 +    return out;
 +}
@@ -126,7 +133,7 @@ index 397504a0b5..0bade391fa 100644
  void FakeESOut::declareEs(const es_format_t *fmt)
  {
      /* Declared ES are only visible until stream data flows.
-@@ -651,16 +689,34 @@ int FakeESOut::esOutSend(es_out_id_t *p_es, block_t *p_block)
+@@ -651,16 +696,35 @@ int FakeESOut::esOutSend(es_out_id_t *p_es, block_t *p_block)
      p_block->i_dts = fixTimestamp( p_block->i_dts );
      p_block->i_pts = fixTimestamp( p_block->i_pts );
  
@@ -137,13 +144,14 @@ index 397504a0b5..0bade391fa 100644
 -        synchronizationReference.second.continuous = p_block->i_dts;
 -        synchronizationReference.second.segment.demux = p_block->i_dts;
 -        assert(hasSynchronizationReference());
-+        /* Force a monotonic timeline (DTS drives the re-anchor; PTS rides the same
-+         * offset). Establish the sync reference once so the downstream times/PCR math
-+         * keeps working — but anchor it to the FORCED output, not the raw demux ts. */
-+        const bool firstref = !fp_have_ref;
-+        p_block->i_dts = forceContinuity( p_block->i_dts, true );
++        /* Force a monotonic timeline. ES data FOLLOWS the offset (reanchor=false); the
++         * PCR (esOutControl) drives the re-anchor since it leads the data. Establish the
++         * sync reference once — anchored to the FORCED output — so the downstream
++         * times/PCR math keeps working. (Gate on the sync ref itself, not fp_have_ref,
++         * because a leading PCR may have already established fp_have_ref.) */
++        p_block->i_dts = forceContinuity( p_block->i_dts, false );
 +        p_block->i_pts = forceContinuity( p_block->i_pts, false );
-+        if(firstref && p_block->i_dts != VLC_TICK_INVALID && !hasSynchronizationReference())
++        if(p_block->i_dts != VLC_TICK_INVALID && !hasSynchronizationReference())
 +        {
 +            synchronizationReference.second.segment = startTimes;
 +            synchronizationReference.second.continuous = p_block->i_dts;
@@ -168,15 +176,15 @@ index 397504a0b5..0bade391fa 100644
  
      SegmentTimes times;
      if(p_block->i_dts != VLC_TICK_INVALID)
-@@ -720,7 +776,11 @@ int FakeESOut::esOutControl(int i_query, va_list args)
+@@ -720,7 +784,11 @@ int FakeESOut::esOutControl(int i_query, va_list args)
              {
                  pcr = fixTimestamp( pcr );
  
 -                pcr = applyTimestampContinuity( pcr );
-+                /* Force mode: PCR rides the same shared offset as the ES data (no
-+                 * re-anchor on PCR — the ES DTS drives that), so the clock reference
-+                 * tracks the forced monotonic timeline instead of the raw PCR. */
-+                pcr = b_force_playlist ? forceContinuity( pcr, false )
++                /* Force mode: the PCR DRIVES the re-anchor (it leads the ES data), so the
++                 * forced monotonic clock reference is set at the segment boundary before
++                 * any frame of the new segment is emitted; ES data then rides this offset. */
++                pcr = b_force_playlist ? forceContinuity( pcr, true )
 +                                       : applyTimestampContinuity( pcr );
  
                  times = synchronizationReference.second.segment;
