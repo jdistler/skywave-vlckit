@@ -50,12 +50,17 @@ jobs:
           restore-keys: |
             vlc-${{ runner.os }}-85a537d69-
 
-      - name: Build VLCKit (device + simulator)
+      # Device-only (iphoneos arm64). We install only to a physical iPhone via xtool and
+      # never use the iOS Simulator, so the x86_64 + arm64 SIMULATOR libVLC slices are dead
+      # weight — "-a aarch64" skips them (is_simulator_arch is false for aarch64), roughly
+      # halving the post-contrib-cache compile. The resulting xcframework carries just the
+      # ios-arm64 slice, which is the one xtool/SwiftPM select for a device build.
+      - name: Build VLCKit (device arm64 only)
         run: |
           set -o pipefail
           VFLAG=""
           if [ "${{ github.event.inputs.verbose }}" = "true" ]; then VFLAG="-v"; fi
-          ./compileAndBuildVLCKit.sh -f $VFLAG
+          ./compileAndBuildVLCKit.sh -f -a aarch64 $VFLAG
 
       - name: Locate + package xcframework
         id: pkg
