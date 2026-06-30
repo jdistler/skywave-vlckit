@@ -1,4 +1,4 @@
-From f63b1c82ba0903edad31381cb8547c85bc8eff98 Mon Sep 17 00:00:00 2001
+From 820b0e51c045dc13ca18ea3944bfa7caf6333936 Mon Sep 17 00:00:00 2001
 From: jdistler <josephcd921@gmail.com>
 Date: Mon, 29 Jun 2026 17:17:26 -0500
 Subject: [PATCH 13/14] audio_output: make late-audio flush thresholds tunable
@@ -29,10 +29,10 @@ post-restart drift be absorbed by the resampler instead of flush-looping.
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 ---
  src/audio_output/aout_internal.h |  7 +++++++
- src/audio_output/dec.c           | 13 ++++++++++++-
- src/input/decoder.c              |  8 ++++++++
+ src/audio_output/dec.c           | 29 ++++++++++++++++++++++-------
+ src/input/decoder.c              | 13 +++++++++++++
  src/libvlc-module.c              | 18 ++++++++++++++++++
- 4 files changed, 45 insertions(+), 1 deletion(-)
+ 4 files changed, 60 insertions(+), 7 deletions(-)
 
 diff --git a/src/audio_output/aout_internal.h b/src/audio_output/aout_internal.h
 index 0ba059464b..8d9e8dfba9 100644
@@ -53,7 +53,7 @@ index 0ba059464b..8d9e8dfba9 100644
  
  vlc_aout_stream *vlc_aout_stream_New(audio_output_t *p_aout,
 diff --git a/src/audio_output/dec.c b/src/audio_output/dec.c
-index 6243296c02..31228a7b92 100644
+index 6243296c02..9e8fd161b6 100644
 --- a/src/audio_output/dec.c
 +++ b/src/audio_output/dec.c
 @@ -68,6 +68,10 @@ struct vlc_aout_stream
@@ -80,7 +80,7 @@ index 6243296c02..31228a7b92 100644
  
      stream->discontinuity.draining = false;
      stream_ResetTimings(stream);
-@@ -631,7 +641,8 @@ static void stream_HandleDrift(vlc_aout_stream *stream, vlc_tick_t drift,
+@@ -631,17 +641,22 @@ static void stream_HandleDrift(vlc_aout_stream *stream, vlc_tick_t drift,
       * where supported. The other alternative is to flush the buffers
       * completely. */
      if (drift > (stream->sync.played ?
@@ -90,27 +90,58 @@ index 6243296c02..31228a7b92 100644
      {
          if (tracer != NULL)
              vlc_tracer_TraceEvent(tracer, "RENDER", stream->str_id, "late_flush");
+ 
+-        if (stream->sync.played)
+-            msg_Warn (aout, "playback way too late (%"PRId64"): "
+-                      "flushing buffers", drift);
+-        else
+-            msg_Dbg (aout, "playback too late (%"PRId64"): "
+-                     "flushing buffers", drift);
++        /* Skywave DIAGNOSTIC: include played-state and the EFFECTIVE threshold
++         * (ticks) actually in force, so a flush event in telemetry self-reports
++         * whether the tunable tolerance took effect rather than us inferring it. */
++        msg_Warn (aout, "playback too late (%"PRId64"): flushing buffers "
++                  "[played=%d thresh=%"PRId64" late_tol=%"PRId64" resync_tol=%"PRId64"]",
++                  drift, (int)stream->sync.played,
++                  (vlc_tick_t)(stream->sync.played ?
++                      lroundf((float)stream->sync.late_tolerance / rate) :
++                      lroundf((float)stream->sync.resync_tolerance / rate)),
++                  stream->sync.late_tolerance, stream->sync.resync_tolerance);
+         vlc_aout_stream_Flush(stream);
+         stream_StopResampling(stream);
+ 
 diff --git a/src/input/decoder.c b/src/input/decoder.c
-index 64edcf7699..272ee2aec2 100644
+index 64edcf7699..4622d4e5a9 100644
 --- a/src/input/decoder.c
 +++ b/src/input/decoder.c
-@@ -687,6 +687,14 @@ static int ModuleThread_UpdateAudioFormat( decoder_t *p_dec )
+@@ -681,12 +681,25 @@ static int ModuleThread_UpdateAudioFormat( decoder_t *p_dec )
+         p_aout = input_resource_GetAout( p_owner->p_resource );
+         if( p_aout )
+         {
++            /* Skywave: tunable audio drift tolerances. Read here (the decoder
++             * inherits per-input options) and plumbed to the aout stream, which
++             * itself is parented to the player and would not inherit per-media
++             * ":audio-*-tolerance" options on its own. DIAGNOSTIC: log the raw
++             * inherited millisecond values so we can CONFIRM (not infer) whether
++             * a per-media :audio-*-tolerance override actually reaches the decoder
++             * vs falling back to the module default. */
++            const int64_t i_late_ms = var_InheritInteger(p_dec, "audio-late-tolerance");
++            const int64_t i_resync_ms = var_InheritInteger(p_dec, "audio-resync-tolerance");
++            msg_Warn(p_dec, "skywave-aout-tol: inherited late=%lld ms resync=%lld ms",
++                     (long long)i_late_ms, (long long)i_resync_ms);
+             const struct vlc_aout_stream_cfg cfg = {
+                 .fmt = &format,
+                 .profile = p_dec->fmt_out.i_profile,
                  .clock = p_owner->p_clock,
                  .str_id = p_owner->psz_id,
                  .replay_gain = &p_dec->fmt_out.audio_replay_gain,
-+                /* Skywave: tunable audio drift tolerances. Read here (the decoder
-+                 * inherits per-input options) and plumbed to the aout stream,
-+                 * which itself is parented to the player and would not inherit
-+                 * per-media ":audio-*-tolerance" options on its own. */
-+                .late_tolerance =
-+                    VLC_TICK_FROM_MS(var_InheritInteger(p_dec, "audio-late-tolerance")),
-+                .resync_tolerance =
-+                    VLC_TICK_FROM_MS(var_InheritInteger(p_dec, "audio-resync-tolerance")),
++                .late_tolerance = VLC_TICK_FROM_MS(i_late_ms),
++                .resync_tolerance = VLC_TICK_FROM_MS(i_resync_ms),
              };
              p_astream = vlc_aout_stream_New( p_aout, &cfg );
              if( p_astream == NULL )
 diff --git a/src/libvlc-module.c b/src/libvlc-module.c
-index 7af1aa8ac2..bd2bcc1b69 100644
+index 7af1aa8ac2..4279d1891b 100644
 --- a/src/libvlc-module.c
 +++ b/src/libvlc-module.c
 @@ -176,6 +176,18 @@ static const char *ppsz_roles_text[] = {
@@ -136,10 +167,10 @@ index 7af1aa8ac2..bd2bcc1b69 100644
      add_integer( "audio-desync", 0, DESYNC_TEXT,
                   DESYNC_LONGTEXT )
          change_safe ()
-+    add_integer( "audio-late-tolerance", 1000, AUDIO_LATE_TOL_TEXT,
++    add_integer( "audio-late-tolerance", 180, AUDIO_LATE_TOL_TEXT,
 +                 AUDIO_LATE_TOL_LONGTEXT )
 +        change_safe ()
-+    add_integer( "audio-resync-tolerance", 1000, AUDIO_RESYNC_TOL_TEXT,
++    add_integer( "audio-resync-tolerance", 0, AUDIO_RESYNC_TOL_TEXT,
 +                 AUDIO_RESYNC_TOL_LONGTEXT )
 +        change_safe ()
  
