@@ -1,7 +1,7 @@
-From 1b922d3e40ff143c3844d0cea16ca2b5b227d430 Mon Sep 17 00:00:00 2001
+From 24f1d6e7b867fc6959e87fe13eabc68f609f1a03 Mon Sep 17 00:00:00 2001
 From: jdistler <josephcd921@gmail.com>
 Date: Mon, 29 Jun 2026 19:02:54 -0500
-Subject: [PATCH] demux: adaptive: option to keep raw segment timestamps
+Subject: [PATCH 14/14] demux: adaptive: option to keep raw segment timestamps
  (ignore ID3 mapping)
 
 Some live HLS origins apply the Apple ID3 transportStreamTimestamp mapping to

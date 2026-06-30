@@ -1,7 +1,7 @@
-From 940dda4ad7630ef42a4f5f26f00c319ae9e85a46 Mon Sep 17 00:00:00 2001
+From f63b1c82ba0903edad31381cb8547c85bc8eff98 Mon Sep 17 00:00:00 2001
 From: jdistler <josephcd921@gmail.com>
 Date: Mon, 29 Jun 2026 17:17:26 -0500
-Subject: [PATCH] audio_output: make late-audio flush thresholds tunable
+Subject: [PATCH 13/14] audio_output: make late-audio flush thresholds tunable
 
 stream_HandleDrift() flushes the audio output whenever the render is "too
 late": beyond 3*AOUT_MAX_PTS_DELAY once playing, or beyond 0 (i.e. any
@@ -110,7 +110,7 @@ index 64edcf7699..272ee2aec2 100644
              p_astream = vlc_aout_stream_New( p_aout, &cfg );
              if( p_astream == NULL )
 diff --git a/src/libvlc-module.c b/src/libvlc-module.c
-index 7af1aa8ac2..4279d1891b 100644
+index 7af1aa8ac2..bd2bcc1b69 100644
 --- a/src/libvlc-module.c
 +++ b/src/libvlc-module.c
 @@ -176,6 +176,18 @@ static const char *ppsz_roles_text[] = {
@@ -136,10 +136,10 @@ index 7af1aa8ac2..4279d1891b 100644
      add_integer( "audio-desync", 0, DESYNC_TEXT,
                   DESYNC_LONGTEXT )
          change_safe ()
-+    add_integer( "audio-late-tolerance", 180, AUDIO_LATE_TOL_TEXT,
++    add_integer( "audio-late-tolerance", 1000, AUDIO_LATE_TOL_TEXT,
 +                 AUDIO_LATE_TOL_LONGTEXT )
 +        change_safe ()
-+    add_integer( "audio-resync-tolerance", 0, AUDIO_RESYNC_TOL_TEXT,
++    add_integer( "audio-resync-tolerance", 1000, AUDIO_RESYNC_TOL_TEXT,
 +                 AUDIO_RESYNC_TOL_LONGTEXT )
 +        change_safe ()
  
