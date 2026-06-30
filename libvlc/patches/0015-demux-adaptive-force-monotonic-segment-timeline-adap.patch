@@ -1,4 +1,4 @@
-From 2c2fb99330a599d1569bf8a5c98684f494bd34d3 Mon Sep 17 00:00:00 2001
+From cd8ad2f8fd70cdaf69e1bda96474f973847a4967 Mon Sep 17 00:00:00 2001
 From: jdistler <josephcd921@gmail.com>
 Date: Tue, 30 Jun 2026 09:40:28 -0500
 Subject: [PATCH 15/15] demux: adaptive: force monotonic segment timeline
@@ -22,9 +22,9 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 ---
  modules/demux/adaptive/Streams.cpp            |  2 +
  modules/demux/adaptive/adaptive.cpp           | 11 +++
- modules/demux/adaptive/plumbing/FakeESOut.cpp | 86 +++++++++++++++++--
+ modules/demux/adaptive/plumbing/FakeESOut.cpp | 93 +++++++++++++++++--
  modules/demux/adaptive/plumbing/FakeESOut.hpp | 13 +++
- 4 files changed, 103 insertions(+), 9 deletions(-)
+ 4 files changed, 110 insertions(+), 9 deletions(-)
 
 diff --git a/modules/demux/adaptive/Streams.cpp b/modules/demux/adaptive/Streams.cpp
 index 35eba79989..3415bce02a 100644
@@ -69,7 +69,7 @@ index e81074f4f0..5df0008469 100644
  vlc_module_end ()
  
 diff --git a/modules/demux/adaptive/plumbing/FakeESOut.cpp b/modules/demux/adaptive/plumbing/FakeESOut.cpp
-index 397504a0b5..bf93978b8d 100644
+index 397504a0b5..8a60b474b9 100644
 --- a/modules/demux/adaptive/plumbing/FakeESOut.cpp
 +++ b/modules/demux/adaptive/plumbing/FakeESOut.cpp
 @@ -509,7 +509,7 @@ vlc_tick_t FakeESOut::fixTimestamp(vlc_tick_t ts)
@@ -81,7 +81,7 @@ index 397504a0b5..bf93978b8d 100644
              return ts;
  
          if(associated.b_timestamp_set)
-@@ -584,6 +584,51 @@ vlc_tick_t FakeESOut::applyTimestampContinuity(vlc_tick_t ts)
+@@ -584,6 +584,58 @@ vlc_tick_t FakeESOut::applyTimestampContinuity(vlc_tick_t ts)
      return ts;
  }
  
@@ -125,7 +125,14 @@ index 397504a0b5..bf93978b8d 100644
 +        }
 +    }
 +    vlc_tick_t out = ts + fp_offset;
-+    if(out > fp_last_out)        /* high-water-mark advances on every PCR + ES timestamp */
++    /* The continuation point tracks ONLY the PCR (reanchor==true), i.e. the program-clock
++     * position — NOT the ES data. ES streams buffer ahead of the PCR by different amounts
++     * (audio typically leads), so advancing fp_last_out on every ES would make the re-anchor
++     * continue from whichever ES is furthest ahead, dragging the clock forward and the other
++     * ES behind — a runaway A/V divergence (audio races seconds ahead → "playing silence"
++     * waves; video falls seconds behind → "picture too late"). Tracking the PCR alone keeps
++     * each ES at its natural lead/lag relative to the clock, so A/V stay locked. */
++    if(reanchor && out > fp_last_out)
 +        fp_last_out = out;
 +    return out;
 +}
@@ -133,7 +140,7 @@ index 397504a0b5..bf93978b8d 100644
  void FakeESOut::declareEs(const es_format_t *fmt)
  {
      /* Declared ES are only visible until stream data flows.
-@@ -651,16 +696,35 @@ int FakeESOut::esOutSend(es_out_id_t *p_es, block_t *p_block)
+@@ -651,16 +703,35 @@ int FakeESOut::esOutSend(es_out_id_t *p_es, block_t *p_block)
      p_block->i_dts = fixTimestamp( p_block->i_dts );
      p_block->i_pts = fixTimestamp( p_block->i_pts );
  
@@ -176,7 +183,7 @@ index 397504a0b5..bf93978b8d 100644
  
      SegmentTimes times;
      if(p_block->i_dts != VLC_TICK_INVALID)
-@@ -720,7 +784,11 @@ int FakeESOut::esOutControl(int i_query, va_list args)
+@@ -720,7 +791,11 @@ int FakeESOut::esOutControl(int i_query, va_list args)
              {
                  pcr = fixTimestamp( pcr );
  
