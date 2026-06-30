@@ -1,0 +1,116 @@
+From 1b922d3e40ff143c3844d0cea16ca2b5b227d430 Mon Sep 17 00:00:00 2001
+From: jdistler <josephcd921@gmail.com>
+Date: Mon, 29 Jun 2026 19:02:54 -0500
+Subject: [PATCH] demux: adaptive: option to keep raw segment timestamps
+ (ignore ID3 mapping)
+
+Some live HLS origins apply the Apple ID3 transportStreamTimestamp mapping to
+only SOME segments. FakeESOut::fixTimestamp() then remaps the tagged segments
+onto the ID3 base while untagged segments keep their raw broadcast PTS, so the
+output timeline flips between two bases differing by hours and playback
+freezes (the master clock anchors on one base, frames on the other are dropped
+as wildly too late).
+
+The raw broadcast PTS are themselves continuous and A/V-aligned, so add
+"adaptive-ts-keep-raw" (default off): when set, fixTimestamp() passes the
+demuxed timestamps through unchanged, ignoring the inconsistent mapping, which
+yields a single clean timeline. Plumbed from the demux object into FakeESOut at
+stream init. Default-off preserves stock behaviour exactly.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ modules/demux/adaptive/Streams.cpp            |  2 ++
+ modules/demux/adaptive/adaptive.cpp           | 11 +++++++++++
+ modules/demux/adaptive/plumbing/FakeESOut.cpp |  9 +++++++++
+ modules/demux/adaptive/plumbing/FakeESOut.hpp |  6 ++++++
+ 4 files changed, 28 insertions(+)
+
+diff --git a/modules/demux/adaptive/Streams.cpp b/modules/demux/adaptive/Streams.cpp
+index 476f43536c..35eba79989 100644
+--- a/modules/demux/adaptive/Streams.cpp
++++ b/modules/demux/adaptive/Streams.cpp
+@@ -84,6 +84,8 @@ bool AbstractStream::init(const StreamFormat &format_, SegmentTracker *tracker)
+             {
+                 /* All successful */
+                 fakeesout->setExtraInfoProvider( this );
++                fakeesout->setKeepRawTimestamps(
++                    var_InheritBool(p_realdemux, "adaptive-ts-keep-raw") );
+                 const Role & streamRole = tracker->getStreamRole();
+                 if(streamRole.isDefault() && streamRole.autoSelectable())
+                     fakeesout->setPriority(ES_PRIORITY_MIN + 10);
+diff --git a/modules/demux/adaptive/adaptive.cpp b/modules/demux/adaptive/adaptive.cpp
+index de9307d97c..e81074f4f0 100644
+--- a/modules/demux/adaptive/adaptive.cpp
++++ b/modules/demux/adaptive/adaptive.cpp
+@@ -84,6 +84,15 @@ static void Close   (vlc_object_t *);
+ #define ADAPT_LOWLATENCY_TEXT N_("Low latency")
+ #define ADAPT_LOWLATENCY_LONGTEXT N_("Overrides low latency parameters")
+ 
++#define ADAPT_TSKEEPRAW_TEXT N_("Keep raw segment timestamps (ignore HLS ID3 mapping)")
++#define ADAPT_TSKEEPRAW_LONGTEXT N_( \
++    "Ignore the per-segment Apple ID3 transportStreamTimestamp mapping and use the raw " \
++    "demuxed timestamps as-is. Some live HLS origins tag only SOME segments, which remaps " \
++    "those onto a different base while untagged segments keep their raw broadcast PTS, so " \
++    "the timeline jumps by hours and playback freezes. The raw PTS are themselves continuous, " \
++    "so passing them through gives one clean timeline. Off by default (upstream behaviour); " \
++    "enable for such non-conformant streams.")
++
+ static const AbstractAdaptationLogic::LogicType pi_logics[] = {
+                                 AbstractAdaptationLogic::LogicType::Default,
+                                 AbstractAdaptationLogic::LogicType::Predictive,
+@@ -143,6 +152,8 @@ vlc_module_begin ()
+                      ADAPT_MAXBUFFER_TEXT, nullptr )
+         add_integer( "adaptive-lowlatency", -1, ADAPT_LOWLATENCY_TEXT, ADAPT_LOWLATENCY_LONGTEXT )
+             change_integer_list(rgi_latency, ppsz_latency)
++        add_bool   ( "adaptive-ts-keep-raw", false, ADAPT_TSKEEPRAW_TEXT, ADAPT_TSKEEPRAW_LONGTEXT )
++            change_safe ()
+         set_callbacks( Open, Close )
+ vlc_module_end ()
+ 
+diff --git a/modules/demux/adaptive/plumbing/FakeESOut.cpp b/modules/demux/adaptive/plumbing/FakeESOut.cpp
+index 2304b56811..397504a0b5 100644
+--- a/modules/demux/adaptive/plumbing/FakeESOut.cpp
++++ b/modules/demux/adaptive/plumbing/FakeESOut.cpp
+@@ -503,6 +503,15 @@ vlc_tick_t FakeESOut::fixTimestamp(vlc_tick_t ts)
+ {
+     if(ts != VLC_TICK_INVALID)
+     {
++        /* Some live HLS origins apply the Apple ID3 transportStreamTimestamp mapping to only
++         * SOME segments, which remaps those onto a different base while untagged segments keep
++         * their raw broadcast PTS — the timeline then jumps by hours and freezes playback. When
++         * b_keep_raw is set, ignore the (inconsistent) mapping entirely: the underlying raw
++         * broadcast PTS are continuous and A/V-aligned, so passing them through unchanged yields a
++         * single clean timeline. Opt-in via "adaptive-ts-keep-raw"; off preserves stock behaviour. */
++        if(b_keep_raw)
++            return ts;
++
+         if(associated.b_timestamp_set)
+         {
+             /* Some streams (ex: HLS) have a timestamp mapping
+diff --git a/modules/demux/adaptive/plumbing/FakeESOut.hpp b/modules/demux/adaptive/plumbing/FakeESOut.hpp
+index dbca34eb6c..a3b9fb6847 100644
+--- a/modules/demux/adaptive/plumbing/FakeESOut.hpp
++++ b/modules/demux/adaptive/plumbing/FakeESOut.hpp
+@@ -92,6 +92,11 @@ namespace adaptive
+             void setAssociatedTimestamp( vlc_tick_t, vlc_tick_t );
+             void setExpectedTimestamp( vlc_tick_t );
+             void resetTimestamps();
++            /* When true, fixTimestamp() ignores the per-segment ID3 timestamp
++             * mapping and passes the raw demuxed timestamps through unchanged, so a
++             * stream whose origin tags only some segments doesn't flip between two
++             * timeline bases. See "adaptive-ts-keep-raw". */
++            void setKeepRawTimestamps( bool b ) { b_keep_raw = b; }
+             size_t esCount() const;
+             bool hasSelectedEs() const;
+             bool hasSelectedEs(const AbstractFakeESOutID *) const;
+@@ -144,6 +149,7 @@ namespace adaptive
+                 bool b_offset_calculated;
+             } associated, expected;
+             vlc_tick_t timestamps_offset;
++            bool b_keep_raw = false;
+             int priority;
+             bool b_in_commands_group;
+             enum class PcrStatus
+-- 
+2.43.0
+
