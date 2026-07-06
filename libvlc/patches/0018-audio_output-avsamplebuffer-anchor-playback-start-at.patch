@@ -1,0 +1,194 @@
+From dc944f15ff8dc6475dc3b4e49f1e0afcf2d8852d Mon Sep 17 00:00:00 2001
+From: jdistler <josephcd921@gmail.com>
+Date: Mon, 6 Jul 2026 18:11:08 -0500
+Subject: [PATCH] audio_output: avsamplebuffer: anchor playback start at the
+ intended host time
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The deferred start engaged the render synchronizer with setRate:time:,
+which starts the timebase whenever that call actually executes — after
+the timedwait wakeup, buffer-lock reacquisition and the synchronizer's
+own asynchronous rate transition. Measured on iOS, that slippage is a
+remarkably constant ~150-170ms, and it reads back through the periodic
+time observer as a permanent "playback too late" drift on every
+single start: the core then up-samples for ~15-20s (1% resampling cap)
+to slew it away — an audible A/V desync window after every open,
+reconnect or flush.
+
+Use setRate:time:atHostTime: (macOS 11.3 / iOS 14.5+) to pin the rate
+change to the intended start date, making the start deterministic
+regardless of scheduling latency. Also compute that start date directly
+from the first queued block's play date (new _startDate) instead of the
+rolling (_lastDate - writtenTicks) reconstruction, which wobbles with
+pts jitter and with whichever blocks happen to be appended but not yet
+enqueued at evaluation time.
+
+A first-timing-report diagnostic logs the residual lag (should now read
+~0; pre-patch it showed the ~150-170ms).
+---
+ modules/audio_output/apple/avsamplebuffer.m | 85 ++++++++++++++++++---
+ 1 file changed, 75 insertions(+), 10 deletions(-)
+
+diff --git a/modules/audio_output/apple/avsamplebuffer.m b/modules/audio_output/apple/avsamplebuffer.m
+index 7946047659..500efa0c5f 100644
+--- a/modules/audio_output/apple/avsamplebuffer.m
++++ b/modules/audio_output/apple/avsamplebuffer.m
+@@ -73,6 +73,15 @@ API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS) VISIONOS_API_AVAILA
+     int64_t _ptsSamples;
+     vlc_tick_t _firstPts;
+     vlc_tick_t _lastDate;
++    /* Skywave (patch 0018): system date at which the FIRST queued sample must
++     * play — the exact start deadline. The previous rolling computation
++     * (_lastDate - writtenTicks) drifts with pts jitter and with whichever
++     * blocks happen to be appended-but-not-yet-enqueued when it is evaluated. */
++    vlc_tick_t _startDate;
++    /* Skywave (patch 0018): deadline actually used to anchor the start, for
++     * the first-timing-report diagnostic below. */
++    vlc_tick_t _anchorDate;
++    int _timingReports;
+     unsigned _sampleRate;
+     BOOL _stopped;
+     BOOL _dateReached;
+@@ -232,6 +241,9 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
+     _dateReached = NO;
+     _firstPts = VLC_TICK_INVALID;
+     _lastDate = VLC_TICK_INVALID;
++    _startDate = VLC_TICK_INVALID;
++    _anchorDate = VLC_TICK_INVALID;
++    _timingReports = 0;
+ }
+ 
+ - (void)pause:(BOOL)pause date:(vlc_tick_t)date
+@@ -251,16 +263,65 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
+     vlc_tick_t system_now = vlc_tick_now();
+     vlc_tick_t pos_ticks = [VLCAVSample CMTimeTotick:time] + _firstPts;
+ 
++    /* Skywave (patch 0018) DIAGNOSTIC: lag = wall time elapsed since the
++     * anchored start minus reported playback position — the residual startup
++     * drift the core is about to see (positive = audio behind schedule).
++     * Should read ~0 with the anchored start; the pre-patch behaviour showed
++     * a constant ~150-170ms here on every start. */
++    if (_timingReports < 2 && _anchorDate != VLC_TICK_INVALID)
++    {
++        _timingReports++;
++        msg_Dbg(_aout, "skywave-avsb: timing report #%d: pos=%"PRId64" us "
++                "lag=%"PRId64" us", _timingReports,
++                pos_ticks - _firstPts,
++                (system_now - _anchorDate) - (pos_ticks - _firstPts));
++    }
++
+     aout_TimingReport(_aout, system_now, pos_ticks);
+ }
+ 
+-- (void)startNow:(vlc_tick_t)delta
++- (void)startNow:(vlc_tick_t)deadline
+ {
+     assert(!_dateReached);
+ 
+     _dateReached = YES;
+     CMTime time = CMTimeMake(0, _sampleRate);
+-    [_sync setRate:1.0f time:time];
++
++    /* Skywave (patch 0018): anchor the start instead of engaging it "now".
++     * setRate:time: starts the synchronizer's timebase whenever this thread
++     * actually executes it — after the deferred-start timedwait wakeup, lock
++     * reacquisition and the synchronizer's own asynchronous rate transition.
++     * On iOS that slippage measured a remarkably constant ~150-170ms and read
++     * back through the periodic time observer as a permanent "playback too
++     * late" drift on EVERY start; the core then up-samples for ~15-20s (1%
++     * rate cap) to slew it away — an audible lip-sync window after every
++     * open/reconnect. setRate:time:atHostTime: pins the rate change to the
++     * intended host time, making the start deterministic regardless of when
++     * this code runs. Past/invalid deadlines keep the legacy immediate path. */
++    vlc_tick_t now = vlc_tick_now();
++    _anchorDate = deadline;
++    if (deadline != VLC_TICK_INVALID && deadline > now)
++    {
++        if (@available(macOS 11.3, iOS 14.5, tvOS 14.5, watchOS 7.4, *))
++        {
++            CMTime host = CMTimeConvertScale(CMClockGetTime(CMClockGetHostTimeClock()),
++                                             CLOCK_FREQ, kCMTimeRoundingMethod_Default);
++            host.value += deadline - now;
++            msg_Dbg(_aout, "skywave-avsb: anchored start %"PRId64" us ahead",
++                    deadline - now);
++            [_sync setRate:1.0f time:time atHostTime:host];
++        }
++        else
++            [_sync setRate:1.0f time:time];
++    }
++    else
++    {
++        if (deadline != VLC_TICK_INVALID)
++            msg_Dbg(_aout, "skywave-avsb: immediate start (%"PRId64" us past due)",
++                    now - deadline);
++        _anchorDate = now;
++        [_sync setRate:1.0f time:time];
++    }
+ 
+     const CMTime interval = CMTimeMake(CLOCK_FREQ, CLOCK_FREQ);
+     __weak typeof(self) weakSelf = self;
+@@ -281,16 +342,19 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
+         {
+             /* Start playback at the requested date */
+ 
+-            CMTime writtenTime = CMTimeMake(_ptsSamples, _sampleRate);
+-            vlc_tick_t writtenTicks = [VLCAVSample CMTimeTotick:writtenTime];
++            /* Skywave (patch 0018): the start deadline is simply the play
++             * date of the first queued sample — use it directly instead of
++             * the rolling (_lastDate - writtenTicks) reconstruction, which
++             * wobbles with pts jitter and with whichever blocks happen to be
++             * appended-but-not-yet-enqueued at evaluation time. */
+             vlc_tick_t now = vlc_tick_now();
+-            vlc_tick_t deadline = _lastDate - writtenTicks;
++            vlc_tick_t deadline = _startDate;
+             vlc_tick_t delta = deadline - now;
+ 
+             if (delta <= 0)
+             {
+                 msg_Dbg(_aout, "starting late (%"PRId64" us)", delta);
+-                [self startNow:delta];
++                [self startNow:deadline];
+             }
+             else
+             {
+@@ -299,16 +363,13 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
+                 int timeout = 0;
+                 /* Wait for the start date if there are no buffers to enqueue */
+                 while (!_stopped && _outChain == NULL && timeout == 0)
+-                {
+                     timeout = vlc_cond_timedwait(&_bufferWait, &_bufferLock,
+                                                  deadline);
+-                    deadline = _lastDate - writtenTicks;
+-                }
+ 
+                 if (timeout != 0 && !_stopped)
+                 {
+                     msg_Dbg(_aout, "started");
+-                    [self startNow:0];
++                    [self startNow:deadline];
+                 }
+             }
+         }
+@@ -352,6 +413,7 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
+     {
+         _stopped = NO;
+         _firstPts = block->i_pts;
++        _startDate = date;
+         _ptsSamples = 0;
+ 
+         __weak typeof(self) weakSelf = self;
+@@ -516,6 +578,9 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
+     _ptsSamples = -1;
+     _firstPts = VLC_TICK_INVALID;
+     _lastDate = VLC_TICK_INVALID;
++    _startDate = VLC_TICK_INVALID;
++    _anchorDate = VLC_TICK_INVALID;
++    _timingReports = 0;
+     _sampleRate = fmt->i_rate;
+     _bytesPerFrame = desc.mBytesPerFrame;
+ 
+-- 
+2.43.0
+
