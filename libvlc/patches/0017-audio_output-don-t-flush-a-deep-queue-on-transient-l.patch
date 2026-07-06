@@ -1,0 +1,118 @@
+From 3b688bed17d38407c807cb9eec5bbcefb1cda4c4 Mon Sep 17 00:00:00 2001
+From: jdistler <josephcd921@gmail.com>
+Date: Mon, 6 Jul 2026 16:37:16 -0500
+Subject: [PATCH] audio_output: don't flush a deep queue on transient late
+ drift
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Flushing on "playback too late" is a starvation remedy: it assumes the
+queue is (near) empty and playback will stay late until we drop and
+rebuild. When the output still holds substantially more audio than the
+drift, the lateness is a transient renderer-position hiccup and the
+flush is catastrophic: the entire queue is dropped, then the early
+branch refills the hole with silence — queue-depth seconds of dead
+audio while video plays on.
+
+Measured on-device (iOS, avsamplebuffer aout, live TS restream): the
+panel bursts ~30s of stream on connect, the decoder races ahead and
+~33s of audio sits queued; one transient 209ms late report 4s in
+flushed all of it, and audio stayed silent for ~28s (silence-fill of
+the flushed hole) with no further log output.
+
+Only flush when the queued duration cannot absorb the drift
+(queued <= drift + AOUT_MAX_PTS_DELAY) — a genuinely starved output
+behaves exactly as before. Skips are logged and traced
+(late_flush_skipped).
+---
+ src/audio_output/dec.c | 58 +++++++++++++++++++++++++++++-------------
+ 1 file changed, 40 insertions(+), 18 deletions(-)
+
+diff --git a/src/audio_output/dec.c b/src/audio_output/dec.c
+index 9e8fd161b6..d69fae2fa2 100644
+--- a/src/audio_output/dec.c
++++ b/src/audio_output/dec.c
+@@ -611,7 +611,7 @@ static void stream_Silence (vlc_aout_stream *stream, vlc_tick_t length, vlc_tick
+ }
+ 
+ static void stream_HandleDrift(vlc_aout_stream *stream, vlc_tick_t drift,
+-                               vlc_tick_t audio_ts)
++                               vlc_tick_t audio_ts, vlc_tick_t queued)
+ {
+     aout_owner_t *owner = aout_stream_owner(stream);
+     audio_output_t *aout = aout_stream_aout(stream);
+@@ -644,23 +644,45 @@ static void stream_HandleDrift(vlc_aout_stream *stream, vlc_tick_t drift,
+                  lroundf((float)stream->sync.late_tolerance / rate) :
+                  lroundf((float)stream->sync.resync_tolerance / rate)))
+     {
+-        if (tracer != NULL)
+-            vlc_tracer_TraceEvent(tracer, "RENDER", stream->str_id, "late_flush");
+-
+-        /* Skywave DIAGNOSTIC: include played-state and the EFFECTIVE threshold
+-         * (ticks) actually in force, so a flush event in telemetry self-reports
+-         * whether the tunable tolerance took effect rather than us inferring it. */
+-        msg_Warn (aout, "playback too late (%"PRId64"): flushing buffers "
+-                  "[played=%d thresh=%"PRId64" late_tol=%"PRId64" resync_tol=%"PRId64"]",
+-                  drift, (int)stream->sync.played,
+-                  (vlc_tick_t)(stream->sync.played ?
+-                      lroundf((float)stream->sync.late_tolerance / rate) :
+-                      lroundf((float)stream->sync.resync_tolerance / rate)),
+-                  stream->sync.late_tolerance, stream->sync.resync_tolerance);
+-        vlc_aout_stream_Flush(stream);
+-        stream_StopResampling(stream);
++        /* Skywave: flushing is a STARVATION remedy — it assumes the queue is
++         * (near) empty and playback will stay late until we drop and rebuild.
++         * When the output still holds substantially more audio than the drift
++         * (deep queue after a bursty live-restream connect), the lateness is a
++         * transient renderer-position hiccup, and flushing is catastrophic:
++         * the whole queue is dropped, then the "early" branch below refills
++         * the hole with SILENCE — queue-depth seconds of dead audio while
++         * video plays on (measured: one 209ms hiccup against a ~33s queue cut
++         * audio for ~28s). Keep the queue and let the resampler slew instead;
++         * a genuinely starved output (queued <= drift) still flushes as
++         * upstream intends. */
++        if (queued > drift + AOUT_MAX_PTS_DELAY)
++        {
++            if (tracer != NULL)
++                vlc_tracer_TraceEvent(tracer, "RENDER", stream->str_id,
++                                      "late_flush_skipped");
++            msg_Warn (aout, "playback too late (%"PRId64"): flush skipped, "
++                      "%"PRId64" us queued", drift, queued);
++        }
++        else
++        {
++            if (tracer != NULL)
++                vlc_tracer_TraceEvent(tracer, "RENDER", stream->str_id, "late_flush");
++
++            /* Skywave DIAGNOSTIC: include played-state and the EFFECTIVE threshold
++             * (ticks) actually in force, so a flush event in telemetry self-reports
++             * whether the tunable tolerance took effect rather than us inferring it. */
++            msg_Warn (aout, "playback too late (%"PRId64"): flushing buffers "
++                      "[played=%d thresh=%"PRId64" late_tol=%"PRId64" resync_tol=%"PRId64"]",
++                      drift, (int)stream->sync.played,
++                      (vlc_tick_t)(stream->sync.played ?
++                          lroundf((float)stream->sync.late_tolerance / rate) :
++                          lroundf((float)stream->sync.resync_tolerance / rate)),
++                      stream->sync.late_tolerance, stream->sync.resync_tolerance);
++            vlc_aout_stream_Flush(stream);
++            stream_StopResampling(stream);
+ 
+-        return; /* nothing can be done if timing is unknown */
++            return; /* nothing can be done if timing is unknown */
++        }
+     }
+ 
+     /* Early audio output.
+@@ -825,7 +847,7 @@ static void stream_Synchronize(vlc_aout_stream *stream, vlc_tick_t system_now,
+         vlc_clock_Unlock(stream->sync.clock);
+     }
+ 
+-    stream_HandleDrift(stream, drift, dec_pts);
++    stream_HandleDrift(stream, drift, dec_pts, delay);
+ }
+ 
+ void vlc_aout_stream_NotifyTiming(vlc_aout_stream *stream, vlc_tick_t system_ts,
+-- 
+2.43.0
+
