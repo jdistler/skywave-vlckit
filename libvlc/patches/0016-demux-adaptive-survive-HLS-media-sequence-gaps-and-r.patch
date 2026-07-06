@@ -1,0 +1,124 @@
+From bbe022017df954043999c7c0eac3e484925d86fb Mon Sep 17 00:00:00 2001
+From: jdistler <josephcd921@gmail.com>
+Date: Mon, 6 Jul 2026 15:23:22 -0500
+Subject: [PATCH] demux: adaptive: survive HLS media-sequence gaps and resets
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Broken live restreamers (Xtream panels) routinely violate RFC 8216 §6.2.2:
+- EXT-X-MEDIA-SEQUENCE jumps FORWARD between refreshes (segments aged out
+  while the client was rebuffering). SegmentList::updateWith() scaled the
+  gap by inheritDuration(), which HLS playlists never set, and
+  assert(duration) aborted the whole process. Observed as an on-device
+  SIGABRT (iOS .ips, 2026-07-06 14:33) and reproduced 1:1 on desktop with
+  a crafted playlist server: 'Assertion `duration' failed' at
+  SegmentList.cpp:133.
+- EXT-X-MEDIA-SEQUENCE RESETS backward (restream source restarted).
+  Filtering "known" segments then pruned every future refresh: the
+  playlist never advanced again and playback stalled until an external
+  watchdog rebuilt the stream (10-25s outage per reset, repeating).
+
+updateWith() now:
+- scales forward holes by the previous segment's own duration when there
+  is no inheritable @duration (HLS), instead of asserting;
+- renumbers in-playlist backward jumps to keep the local list monotonic,
+  instead of asserting;
+- detects a whole-window backward reset, renumbers the update to continue
+  after the current window (offset remembered across refreshes in
+  sequence_offset), and lets playback flow seamlessly into the restarted
+  source.
+
+Verified against both anomaly shapes with a local simulator: pre-patch
+gap => abort, reset => permanent stall; post-patch both play through
+uninterrupted (45s+, playlist refreshing, segments advancing).
+---
+ .../demux/adaptive/playlist/SegmentList.cpp   | 48 +++++++++++++++++--
+ modules/demux/adaptive/playlist/SegmentList.h |  5 ++
+ 2 files changed, 49 insertions(+), 4 deletions(-)
+
+diff --git a/modules/demux/adaptive/playlist/SegmentList.cpp b/modules/demux/adaptive/playlist/SegmentList.cpp
+index af3cf7520b..279a9b56c5 100644
+--- a/modules/demux/adaptive/playlist/SegmentList.cpp
++++ b/modules/demux/adaptive/playlist/SegmentList.cpp
+@@ -113,6 +113,30 @@ void SegmentList::updateWith(AbstractMultipleSegmentBaseType *updated_,
+     else
+     {
+         const Segment * prevSegment = segments.back();
++
++        /* Re-apply the renumbering accumulated over previous media-sequence
++           resets so this update lines up with our (monotonic) local numbering */
++        if(sequence_offset)
++        {
++            for(auto seg : updated->segments)
++                seg->setSequenceNumber(seg->getSequenceNumber() + sequence_offset);
++        }
++
++        /* Media sequence RESET: the whole update window sits behind the current
++           list (broken live servers restart their source and reset
++           EXT-X-MEDIA-SEQUENCE). Filtering "known" segments would then discard
++           every refresh and the playlist would never advance again. Renumber
++           the update to continue after the current window and remember the
++           shift for subsequent refreshes. */
++        if(updated->segments.back()->getSequenceNumber() < prevSegment->getSequenceNumber())
++        {
++            const uint64_t delta = prevSegment->getSequenceNumber() + 1 -
++                                   updated->segments.front()->getSequenceNumber();
++            sequence_offset += delta;
++            for(auto seg : updated->segments)
++                seg->setSequenceNumber(seg->getSequenceNumber() + delta);
++        }
++
+         const uint64_t oldest = updated->segments.front()->getSequenceNumber();
+ 
+         /* filter out known segments from the update */
+@@ -129,10 +153,26 @@ void SegmentList::updateWith(AbstractMultipleSegmentBaseType *updated_,
+             /* not continuous */
+             if(cur->getSequenceNumber() != prevSegment->getSequenceNumber() + 1)
+             {
+-                assert(prevSegment->getSequenceNumber() < cur->getSequenceNumber());
+-                assert(duration);
+-                uint64_t gap = cur->getSequenceNumber() - prevSegment->getSequenceNumber() - 1;
+-                cur->startTime = cur->startTime + duration * gap;
++                if(prevSegment->getSequenceNumber() < cur->getSequenceNumber())
++                {
++                    /* Forward hole (segments expired between refreshes): scale
++                       the stamp by the gap. HLS lists carry no inheritable
++                       @duration attribute, so fall back to the previous
++                       segment's own duration — this used to assert(duration)
++                       and abort the whole process on live streams. */
++                    const stime_t scale = duration ? duration
++                                                   : prevSegment->duration;
++                    uint64_t gap = cur->getSequenceNumber() - prevSegment->getSequenceNumber() - 1;
++                    cur->startTime = cur->startTime + scale * gap;
++                }
++                else
++                {
++                    /* Sequence went backward INSIDE one playlist (seen from
++                       restreamers emitting EXT-X-MEDIA-SEQUENCE mid-list).
++                       Renumber to keep the local list monotonic; the stamp
++                       stays contiguous. Used to assert() and abort. */
++                    cur->setSequenceNumber(prevSegment->getSequenceNumber() + 1);
++                }
+             }
+             prevSegment = cur;
+             addSegment(cur);
+diff --git a/modules/demux/adaptive/playlist/SegmentList.h b/modules/demux/adaptive/playlist/SegmentList.h
+index c8bb606bc2..9f1e4ceb57 100644
+--- a/modules/demux/adaptive/playlist/SegmentList.h
++++ b/modules/demux/adaptive/playlist/SegmentList.h
+@@ -64,6 +64,11 @@ namespace adaptive
+                 std::vector<Segment *>  segments;
+                 stime_t totalLength;
+                 bool b_relative_mediatimes;
++                /* Cumulative renumbering applied to playlist updates whose
++                   media sequence went BACKWARD (restreamer restarted its
++                   source and reset EXT-X-MEDIA-SEQUENCE). Keeps the local
++                   numbering monotonic across server-side resets. */
++                uint64_t sequence_offset = 0;
+         };
+     }
+ }
+-- 
+2.43.0
+
