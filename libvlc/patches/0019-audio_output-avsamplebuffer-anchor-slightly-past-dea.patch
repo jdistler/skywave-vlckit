@@ -1,0 +1,72 @@
+From d39142e28e1c3c04c3ffbc07fa905235ed5e49f4 Mon Sep 17 00:00:00 2001
+From: jdistler <josephcd921@gmail.com>
+Date: Mon, 6 Jul 2026 19:00:54 -0500
+Subject: [PATCH] audio_output: avsamplebuffer: anchor slightly-past deadlines;
+ warn on multi-second start gaps
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The deferred-start timedwait wakes only AT the deadline, so by the time
+startNow runs the deadline is always a few microseconds in the past —
+the previous 'deadline > now' gate therefore routed every single start
+down the legacy unanchored path (measured on-device: startup lag stayed
+185-193ms on the speaker route and 450-620ms on Bluetooth A2DP, where
+the synchronizer's asynchronous rate transition is slower; one BT start
+exceeded the 500ms flush tolerance outright). Anchor for deadlines up
+to 1s in the past: the timebase mapping is retroactive and the renderer
+trims the elapsed span, so a microseconds-past anchor is exact.
+
+Also warn (skywave-avsb: start deferred N ms) when a deferred start is
+more than 2.5s away: that means the audio between the playhead and the
+next decoded block was flushed out of the renderer (typically by an
+audio-route change - AirPods in/out - via flushedAutomatically) and
+cannot be re-produced; playback would sit silent until wall-clock
+catches up (measured: 36s on a burst-primed TS). The warning gives the
+application a precise signal to cut the wait short with a reconnect.
+---
+ modules/audio_output/apple/avsamplebuffer.m | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/modules/audio_output/apple/avsamplebuffer.m b/modules/audio_output/apple/avsamplebuffer.m
+index 500efa0c5f..3c2d6e1f27 100644
+--- a/modules/audio_output/apple/avsamplebuffer.m
++++ b/modules/audio_output/apple/avsamplebuffer.m
+@@ -300,7 +300,14 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
+      * this code runs. Past/invalid deadlines keep the legacy immediate path. */
+     vlc_tick_t now = vlc_tick_now();
+     _anchorDate = deadline;
+-    if (deadline != VLC_TICK_INVALID && deadline > now)
++    /* Anchor for deadlines in the future OR up to 1s in the past. The deferred
++     * timedwait wakes only AT the deadline, so `now` is always a few us past
++     * it here — a strict `deadline > now` gate would (and, in v1, did) push
++     * every start down the legacy path. A slightly-past anchor is exact: the
++     * timebase mapping is retroactive and the renderer trims the elapsed span.
++     * Far-past deadlines (data arrived very late) keep the legacy behaviour of
++     * playing from the top rather than discarding a large chunk. */
++    if (deadline != VLC_TICK_INVALID && deadline > now - VLC_TICK_FROM_SEC(1))
+     {
+         if (@available(macOS 11.3, iOS 14.5, tvOS 14.5, watchOS 7.4, *))
+         {
+@@ -359,6 +366,18 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
+             else
+             {
+                 msg_Dbg(_aout, "deferring start (%"PRId64" us)", delta);
++                /* Skywave: a start deferred by SECONDS means the audio between
++                 * the playhead and the next decoded block no longer exists in
++                 * the pipeline — the renderer flushed it (typical trigger: an
++                 * audio-route change, AirPods in/out, flushedAutomatically) and
++                 * the decoder cannot re-produce it. Playback would sit silent
++                 * until wall-clock catches up (measured 36s on a burst-primed
++                 * TS). Emit at WARNING so the app's log tap can see it and cut
++                 * the wait short with a reconnect. */
++                if (delta > VLC_TICK_FROM_MS(2500))
++                    msg_Warn(_aout, "skywave-avsb: start deferred %"PRId64" ms "
++                             "— queued audio no longer available",
++                             MS_FROM_VLC_TICK(delta));
+ 
+                 int timeout = 0;
+                 /* Wait for the start date if there are no buffers to enqueue */
+-- 
+2.43.0
+
