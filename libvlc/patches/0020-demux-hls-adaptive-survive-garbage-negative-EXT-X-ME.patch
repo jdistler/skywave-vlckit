@@ -1,0 +1,76 @@
+From 8ebab70d1211c1e7cb09c86721e4f411040ccd62 Mon Sep 17 00:00:00 2001
+From: jdistler <josephcd921@gmail.com>
+Date: Mon, 6 Jul 2026 20:45:04 -0500
+Subject: [PATCH] demux: hls/adaptive: survive garbage negative
+ EXT-X-MEDIA-SEQUENCE
+
+Broken Xtream restreamers emit negative EXT-X-MEDIA-SEQUENCE values ("-1",
+"-3") which wrap near UINT64_MAX through the unsigned istringstream parse.
+Segments then get numbered up to UINT64_MAX:
+
+- a UINT64_MAX-headed list makes the start-segment lookup fail (UINT64_MAX
+  doubles as the 'invalid' sentinel) -> instant EOF / reconnect loop;
+- on a PDT (non-relative) playlist, the next refresh takes updateWith()'s
+  prune-all path, where a segment numbered UINT64_MAX survives
+  pruneBySegmentNumber(UINT64_MAX) and trips assert(segments.empty())
+  -> SIGABRT mid-playback (on-device crash 2026-07-06 14:33).
+
+Two layers:
+- M3U8Parser: treat a wrapped (>= 2^63) media-sequence as a sequence reset
+  to 0 -- no real playlist gets anywhere near 2^63, and the reset machinery
+  already handles renumbering.
+- SegmentList::updateWith: purge whatever survives the prune instead of
+  assert()ing the process away.
+
+Repro: tools/hlslab server.py negseq mode (Skywave repo).
+---
+ modules/demux/adaptive/playlist/SegmentList.cpp | 12 +++++++++++-
+ modules/demux/hls/playlist/Parser.cpp           |  9 +++++++++
+ 2 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/modules/demux/adaptive/playlist/SegmentList.cpp b/modules/demux/adaptive/playlist/SegmentList.cpp
+index 279a9b56c5..ae7995b14d 100644
+--- a/modules/demux/adaptive/playlist/SegmentList.cpp
++++ b/modules/demux/adaptive/playlist/SegmentList.cpp
+@@ -105,7 +105,17 @@ void SegmentList::updateWith(AbstractMultipleSegmentBaseType *updated_,
+     {
+         if(!segments.empty())
+             pruneBySegmentNumber(std::numeric_limits<uint64_t>::max());
+-        assert(segments.empty());
++        /* A segment numbered UINT64_MAX survives the prune-below loop (seen live:
++           garbage negative EXT-X-MEDIA-SEQUENCE wrapping through the unsigned
++           parse — 2026-07-06 on-device abort). Purge the leftovers instead of
++           assert()ing the whole process away mid-playback. */
++        if(!segments.empty())
++        {
++            for(auto seg : segments)
++                delete seg;
++            segments.clear();
++            totalLength = 0;
++        }
+         for(auto seg : updated->segments)
+             addSegment(seg);
+         updated->segments.clear();
+diff --git a/modules/demux/hls/playlist/Parser.cpp b/modules/demux/hls/playlist/Parser.cpp
+index 312b41e795..39084feb7a 100644
+--- a/modules/demux/hls/playlist/Parser.cpp
++++ b/modules/demux/hls/playlist/Parser.cpp
+@@ -314,6 +314,15 @@ void M3U8Parser::parseSegments(vlc_object_t *, HLSRepresentation *rep, const std
+             case SingleValueTag::EXTXMEDIASEQUENCE:
+             {
+                 sequenceNumber = (static_cast<const SingleValueTag*>(tag))->getValue().decimal();
++                /* Broken restreamers emit garbage negative values ("-1", "-3"),
++                   which wrap near UINT64_MAX through the unsigned parse. Segments
++                   then get numbered up to UINT64_MAX — the "invalid" sentinel all
++                   over adaptive, and a number SegmentList::updateWith()'s
++                   prune-below-everything path can never remove (instant EOF at
++                   best, abort at worst). No real playlist gets anywhere near
++                   2^63; treat a wrapped value as a sequence reset. */
++                if(sequenceNumber >= (uint64_t)1 << 63)
++                    sequenceNumber = 0;
+             }
+             break;
+ 
+-- 
+2.43.0
+
