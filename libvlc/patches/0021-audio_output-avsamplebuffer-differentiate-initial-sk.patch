@@ -1,0 +1,140 @@
+From 89ffe61e6a96e8ec13112acdca7409d4a6f91ebf Mon Sep 17 00:00:00 2001
+From: jdistler <josephcd921@gmail.com>
+Date: Sat, 11 Jul 2026 14:08:34 -0500
+Subject: [PATCH] audio_output: avsamplebuffer: differentiate initial-skew
+ vs route-change start-deferrals
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch 0019 introduced the "start deferred N ms" warning at WARNING level
+so the app can cut short a route-change silence gap (AirPods in/out —
+flushedAutomatically destroys the queue, next block's play date is
+36s in the future) with a reconnect. That fix works for its intended
+case.
+
+But the SAME warning fires — with the SAME magnitude — for a completely
+different cause: a fresh open of a stream whose source has a permanent
+audio-video PTS offset. Measured on a live restream: audio_pts is
++36.5s ahead of video_pts at open, and stays +36.1-36.5s throughout the
+stream. VLC's aout dutifully schedules the first audio block 36s in the
+future, which IS correct — audio will play synced once wall-clock
+catches up. But the current warning drives the app to reconnect. The
+fresh open lands on the same offset → warn → reconnect → repeat, and
+audio never plays (or plays only in the brief windows between the
+reconnects — telemetry: audioGapReconnects=5/session, watchedMs 17s).
+
+Differentiate them at the source. Track _hasEverStarted (set true in
+startNow, cleared only in Start — NOT in flush). The next big deferral
+is a route change if _hasEverStarted, or a stream-property offset if
+not. Emit distinct messages so the app's log tap can route them
+correctly:
+
+  _hasEverStarted (route change):
+    "skywave-avsb: start deferred N ms — queued audio no longer available"
+    → app reconnects (unchanged from 0019)
+
+  !_hasEverStarted (stream property):
+    "skywave-avsb: initial start skew N ms — stream audio-video PTS offset"
+    → app does NOT reconnect; libVLC's natural deferred-start plays out
+      and audio arrives synced after the wait
+
+The magnitude alone doesn't work — both are ~36s.
+
+Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
+---
+ modules/audio_output/apple/avsamplebuffer.m | 56 +++++++++++++++++----
+ 1 file changed, 45 insertions(+), 11 deletions(-)
+
+diff --git a/modules/audio_output/apple/avsamplebuffer.m b/modules/audio_output/apple/avsamplebuffer.m
+index 3c2d6e1f27..9407c1cc96 100644
+--- a/modules/audio_output/apple/avsamplebuffer.m
++++ b/modules/audio_output/apple/avsamplebuffer.m
+@@ -85,6 +85,17 @@ API_AVAILABLE(macos(MIN_MACOS), ios(MIN_IOS), tvos(MIN_TVOS) VISIONOS_API_AVAILA
+     unsigned _sampleRate;
+     BOOL _stopped;
+     BOOL _dateReached;
++    /* Skywave (patch 0021): true once startNow has ever run for this aout
++     * session — i.e. audio has anchored and (either just did or will) begin
++     * playing. Reset only by Start (fresh session), NOT by flush. Used by
++     * whenDataReady to distinguish "route change destroyed the queue" from
++     * "fresh open, first buffer's deadline is far in the future because the
++     * source stream's audio PTS is systematically ahead of its video PTS".
++     * Same magnitude on both (measured 36s each), but the meanings — and
++     * the correct app response — differ: a route change is fixable with a
++     * reconnect; a stream-property offset is not, and reconnecting only
++     * thrashes the pipeline. See stream_deferred vs start_deferred below. */
++    BOOL _hasEverStarted;
+ }
+ @end
+ 
+@@ -285,6 +296,10 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
+     assert(!_dateReached);
+ 
+     _dateReached = YES;
++    /* Skywave (patch 0021): mark that audio has anchored — the next flush that
++     * empties the queue will now be treated as a route-change flush (which a
++     * reconnect can fix), not a first-open stream-property gap. */
++    _hasEverStarted = YES;
+     CMTime time = CMTimeMake(0, _sampleRate);
+ 
+     /* Skywave (patch 0018): anchor the start instead of engaging it "now".
+@@ -366,18 +381,36 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
+             else
+             {
+                 msg_Dbg(_aout, "deferring start (%"PRId64" us)", delta);
+-                /* Skywave: a start deferred by SECONDS means the audio between
+-                 * the playhead and the next decoded block no longer exists in
+-                 * the pipeline — the renderer flushed it (typical trigger: an
+-                 * audio-route change, AirPods in/out, flushedAutomatically) and
+-                 * the decoder cannot re-produce it. Playback would sit silent
+-                 * until wall-clock catches up (measured 36s on a burst-primed
+-                 * TS). Emit at WARNING so the app's log tap can see it and cut
+-                 * the wait short with a reconnect. */
++                /* Skywave: a start deferred by SECONDS has TWO distinct causes
++                 * with identical magnitudes (~36s each measured) but opposite
++                 * app-side remedies:
++                 *   (1) ROUTE CHANGE — audio was playing, the renderer flushed
++                 *       automatically (AirPods in/out, flushedAutomatically) and
++                 *       the queue between the playhead and the next decoded
++                 *       block is gone. Reconnecting rebuilds the pipeline at
++                 *       the live edge in ~2s → a WIN.
++                 *   (2) STREAM PROPERTY (patch 0021) — fresh open, the source
++                 *       stream's first audio PES is systematically ahead of its
++                 *       first video PES (measured on a live restream:
++                 *       audio_pts − video_pts = +36.5s, persistent throughout).
++                 *       The wait IS the correct behaviour: audio will play
++                 *       synced after wall-clock catches up. Reconnecting only
++                 *       thrashes — the fresh open lands on the same offset.
++                 * Differentiate on _hasEverStarted: reset by Start (fresh
++                 * session), stays set across flush (route change). The app
++                 * treats the two signals differently: reconnect on `start
++                 * deferred`, DO NOT reconnect on `initial start skew`. */
+                 if (delta > VLC_TICK_FROM_MS(2500))
+-                    msg_Warn(_aout, "skywave-avsb: start deferred %"PRId64" ms "
+-                             "— queued audio no longer available",
+-                             MS_FROM_VLC_TICK(delta));
++                {
++                    if (_hasEverStarted)
++                        msg_Warn(_aout, "skywave-avsb: start deferred %"PRId64" ms "
++                                 "— queued audio no longer available",
++                                 MS_FROM_VLC_TICK(delta));
++                    else
++                        msg_Warn(_aout, "skywave-avsb: initial start skew %"PRId64" ms "
++                                 "— stream audio-video PTS offset",
++                                 MS_FROM_VLC_TICK(delta));
++                }
+ 
+                 int timeout = 0;
+                 /* Wait for the start date if there are no buffers to enqueue */
+@@ -600,6 +633,7 @@ customBlock_Free(void *refcon, void *doomedMemoryBlock, size_t sizeInBytes)
+     _startDate = VLC_TICK_INVALID;
+     _anchorDate = VLC_TICK_INVALID;
+     _timingReports = 0;
++    _hasEverStarted = NO;   /* Skywave (patch 0021): fresh session */
+     _sampleRate = fmt->i_rate;
+     _bytesPerFrame = desc.mBytesPerFrame;
+ 
+-- 
+2.43.0
+
