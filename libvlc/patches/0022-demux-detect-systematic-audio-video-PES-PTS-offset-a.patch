@@ -1,48 +1,54 @@
-From df6781956460c92ee69f6a04d03abadb6afb1ac9 Mon Sep 17 00:00:00 2001
+From 316762d02d87cf777e5d88bbb83c44e1808767d1 Mon Sep 17 00:00:00 2001
 From: jdistler <josephcd921@gmail.com>
-Date: Sat, 11 Jul 2026 15:50:53 -0500
-Subject: [PATCH] demux: detect systematic audio-video PES PTS offset and log
- it
+Date: Sat, 11 Jul 2026 15:57:32 -0500
+Subject: [PATCH] demux: detect audio-video PES PTS offset (TS drift-hint + HLS
+ pill signal)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
-MLB Network on the fullent Xtream panel delivers video with a ~36s
+MLB Network on the fullent Xtream panel delivers video on a ~36s
 tape-delay (live-sports compliance buffer) while audio is live, so the
-audio PES's PTS is a fixed ~36s ahead of the corresponding video PES's
-PTS for the same real event. VLC's default behaviour of scheduling each
-track at its labelled PTS yields correctly synced playback — video
-plays immediately, audio's start-deferred by 36s until wall clock
-catches up, THEN both play synced (bat crack lines up with the swing).
+audio-PES PTS is a fixed ~36s ahead of the corresponding video PES's
+PTS for the same real event. VLC's default behaviour of scheduling
+each track at its labelled PTS yields correctly-synced playback —
+video plays immediately, audio is start-deferred by 36s until wall
+clock catches up, THEN plays synced.
 
-Attempting to compensate at the demux layer (previous iteration of this
-patch) made audio arrive immediately but shifted the content 36s ahead
-of what video was showing — badly desynced.
+Detect this at both es_out.c (raw TS path) and FakeESOut::esOutSend
+(adaptive HLS path — essential because on HLS the audio ES sits in
+the CommandsQueue by media time and never reaches es_out until nearly
+the end of the wait). Fire "skywave-avdiff: …" WARN so the app can
+show its "audio catching up ~Ns" pill uniformly on both formats. Gate
+on |diff|>5s; fire once per session.
 
-The value of the detection is UX: the app can put up an "audio catching
-up ~Ns" pill so the silent-video window reads as "waiting" instead of
-"dead channel." Detect at first video PES + first audio PES in both
-paths (es_out.c for raw TS, FakeESOut for adaptive HLS — essential on
-HLS because the audio ES sits in the CommandsQueue by media time and
-never reaches es_out until nearly the end of the wait). Gate on
-|diff|>5s so a normal small A/V offset never trips.
+On the raw TS path additionally call EsOutSetDelay(-diff). This does
+NOT retime the first audio block (stream_Play at dec.c:936 computes
+play_date via the filter-path clock BEFORE the delay-apply block at
+dec.c:963 — an ordering race no small patch will fix cleanly). But it
+DOES inform the drift-correction resampler that audio is intentionally
+late, which prevents it from speeding audio up to catch imaginary
+lateness. On-device 2026-07-11: patched-15 (no EsOutSetDelay) played
+MLB TS "horribly out of sync"; patched-16 (with) played MLB TS
+correctly synced after the deferred-start wait.
 
-FakeESOut takes an optional vlc_object_t* log context (Streams.cpp
-passes VLC_OBJECT(p_realdemux)) so the WARN line reaches VLCLogTap.
+The FakeESOut path stays detect-only. Original 0022's inline
+p_block->i_pts += -diff shift on HLS moved audio 36s ahead of the
+video content (bat-crack 36s before the swing visual). Removed.
 
-Both sites emit:
-  "skywave-avdiff: first audio-video PES PTS diff N ms — stream property"
-
-Fires ONCE per session; a small A/V offset (<5s) never trips it. No
-regression on healthy channels (ESPN control verified).
+Local hlslab (Linux, harness + pulse aout):
+  MLB TS:  avdiff 36232ms fires, aout defers 36.96s (audio will play
+           synced when it arrives).
+  MLB HLS: avdiff 36218ms fires via FakeESOut, audio ES held in queue.
+  ESPN:    no avdiff, no behavioural change.
 
 Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ---
  modules/demux/adaptive/Streams.cpp            |  3 +-
- modules/demux/adaptive/plumbing/FakeESOut.cpp | 39 +++++++++++-
- modules/demux/adaptive/plumbing/FakeESOut.hpp | 17 +++++-
- src/input/es_out.c                            | 61 +++++++++++++++++++
- 4 files changed, 117 insertions(+), 3 deletions(-)
+ modules/demux/adaptive/plumbing/FakeESOut.cpp | 39 +++++++++-
+ modules/demux/adaptive/plumbing/FakeESOut.hpp | 17 ++++-
+ src/input/es_out.c                            | 74 +++++++++++++++++++
+ 4 files changed, 130 insertions(+), 3 deletions(-)
 
 diff --git a/modules/demux/adaptive/Streams.cpp b/modules/demux/adaptive/Streams.cpp
 index 3415bce02a..677af5e50c 100644
@@ -158,7 +164,7 @@ index 6768b9d3b9..8b38e299f1 100644
              bool b_in_commands_group;
              enum class PcrStatus
 diff --git a/src/input/es_out.c b/src/input/es_out.c
-index d7f65207fa..144dcd511d 100644
+index d7f65207fa..c1e3fa7edc 100644
 --- a/src/input/es_out.c
 +++ b/src/input/es_out.c
 @@ -210,6 +210,22 @@ typedef struct
@@ -184,23 +190,31 @@ index d7f65207fa..144dcd511d 100644
      /* Clock configuration */
      vlc_tick_t  i_pts_delay;
      vlc_tick_t  i_tracks_pts_delay;
-@@ -3140,6 +3156,46 @@ static int EsOutSend(es_out_t *out, es_out_id_t *es, block_t *p_block )
+@@ -3140,6 +3156,59 @@ static int EsOutSend(es_out_t *out, es_out_id_t *es, block_t *p_block )
          }
      }
  
-+    /* Skywave (patch 0022, revised): detect a systematic audio-video PES PTS
-+     * offset and emit a signal — DO NOT try to compensate. Original 0022 shifted
-+     * audio via i_audio_delay assuming the panel had mis-labelled its PTS. Real
-+     * behaviour on MLB Network (confirmed via on-device 2026-07-11): the panel's
-+     * PTS is honest — video is delivered on a ~36s tape-delay (live-sports
-+     * compliance buffering) while audio is live, so the audio-video PES PTS diff
-+     * reflects a REAL content-time offset. Playing them at their labelled PTS
-+     * (VLC's default: video now, audio 36s later once it arrives) yields
-+     * correctly-synced playback; shifting audio earlier breaks the sync by
-+     * bat-hit-vs-crack magnitude. The value of firing here is UX: the app can
-+     * put up "audio catching up ~Ns" so the silent-video window reads as
-+     * "waiting" rather than "dead channel." Fires once per es_out session; gated
-+     * on |diff| > 5s so a normal small A/V offset never trips it. */
++    /* Skywave (patch 0022): auto-detect systematic audio-video PES PTS offset.
++     * Some restream panels (fullent MLB Network) deliver video on a ~36s
++     * tape-delay (live-sports compliance buffer) while audio is live, so the
++     * audio-PES PTS is a fixed ~36s ahead of the corresponding video PES.
++     * VLC's default behaviour of scheduling each track at its labelled PTS
++     * yields correctly-synced playback — audio just arrives 36s after open
++     * once wall clock catches up. Two things fall out of that:
++     *   1. UX: emit a WARNING so the app's VLCLogTap can put up an "audio
++     *      catching up ~Ns" pill.
++     *   2. On the raw TS path, ALSO set `i_audio_delay = -diff`. This does
++     *      NOT change the FIRST audio block's play_date (stream_Play at
++     *      dec.c:936 converts play_date via the filter-path clock before the
++     *      delay-apply block at dec.c:963 — a race no small patch will fix
++     *      cleanly), but it DOES inform the drift-correction machinery that
++     *      audio is intentionally late, preventing the resampler from
++     *      speeding audio up to catch imaginary lateness. On-device 2026-07-11
++     *      proved this: patched-15 (no EsOutSetDelay call) played TS
++     *      "horribly out of sync"; patched-16 (with the call) played TS
++     *      correctly synced after the deferred-start wait.
++     *
++     * Gate on |diff|>5s; fire once per es_out session. */
 +    if( !p_sys->skywave_avdiff_applied
 +        && p_block->i_pts != VLC_TICK_INVALID
 +        && ( es->fmt.i_cat == VIDEO_ES || es->fmt.i_cat == AUDIO_ES ) )
@@ -221,8 +235,13 @@ index d7f65207fa..144dcd511d 100644
 +            {
 +                msg_Warn( p_input,
 +                    "skywave-avdiff: first audio-video PES PTS diff %"PRId64" ms "
-+                    "— stream property (no correction)",
-+                    MS_FROM_VLC_TICK(diff) );
++                    "— setting audio_delay=%"PRId64" ms (drift-correction hint)",
++                    MS_FROM_VLC_TICK(diff), -MS_FROM_VLC_TICK(diff) );
++                /* Set the audio delay so drift correction doesn't speed audio
++                 * up. Does NOT retime the first block (dec.c ordering race);
++                 * the aout still naturally defers the first block by ~diff ms,
++                 * and the audio arrives synced when wall clock catches up. */
++                EsOutSetDelay( p_sys, AUDIO_ES, -diff );
 +            }
 +            p_sys->skywave_avdiff_applied = true;
 +        }
@@ -231,7 +250,7 @@ index d7f65207fa..144dcd511d 100644
      /* Drop all ESes except the video one in case of next-frame */
      if( p_sys->p_next_frame_es != NULL && p_sys->p_next_frame_es != es )
      {
-@@ -4331,6 +4387,11 @@ input_EsOutNew(input_thread_t *p_input, input_source_t *main_source, float rate,
+@@ -4331,6 +4400,11 @@ input_EsOutNew(input_thread_t *p_input, input_source_t *main_source, float rate,
                         = p_sys->i_last_pts_jitter = VLC_TICK_INVALID;
      p_sys->i_cr_average = 0;
  
