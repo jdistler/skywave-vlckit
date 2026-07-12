@@ -1,0 +1,125 @@
+From 9b0ec041ee2937dffbc515dfd86a8daf2cab0b15 Mon Sep 17 00:00:00 2001
+From: jdistler <josephcd921@gmail.com>
+Date: Sun, 12 Jul 2026 07:54:15 -0500
+Subject: [PATCH] clock: reject stale near-max-33-bit PCR values from broken
+ restream transcoders
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Some Xtream restream transcoders emit an uninitialized PCR value near the
+33-bit maximum (~95443.7 s) at splice/resync points. Verified strong panel
+'RC: ECDF' 2026-07-12: a 95443.018 s stale PCR at packet #3 of the raw TS,
+plus a second splice ~30 s into playback made VLC's stream_diff<0 recovery
+path re-anchor the whole pipeline on the stale value ('new clock context(1)
+@95443017689', VideoToolbox kVTVideoDecoderBadDataErr), permanently freezing
+video for the rest of the watch.
+
+Reject any PCR whose raw stream time exceeds SKYWAVE_STALE_PCR_THRESHOLD
+(90000 s). Only fires once a stable clock reference is established — the
+FIRST PCR at open is allowed through even if it's stale, because the
+existing stream_diff<0 discontinuity path handles a stale-then-real startup
+transition correctly. Cheap check in the hot path, warns once every 500 ms
+under the 'skywave-stale-pcr:' marker so VLCLogTap can telemeter it.
+
+Reproduced end-to-end via a synthetic TS built by re-injecting the panel's
+own stale-PCR packet 5 s into a normal capture:
+  vanilla libvlc: 'clock gap ... stream_diff: -5671989', 'new clock
+    context(1) @95443017689', 'Using a new clock context (1), flushing static
+    filters' — exact on-device signature.
+  patched libvlc: 'skywave-stale-pcr: dropping PCR near 33-bit max
+    (value=95443717678 us, threshold=90000000000 us)' — zero clock gaps,
+    zero context switches, zero flush, playback progresses identically.
+
+skywave-audio-tolerance branch.
+---
+ src/clock/input_clock.c | 52 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+
+diff --git a/src/clock/input_clock.c b/src/clock/input_clock.c
+index 01d873b679..a45d0e700e 100644
+--- a/src/clock/input_clock.c
++++ b/src/clock/input_clock.c
+@@ -85,6 +85,22 @@
+ 
+ #define CR_MAX_GAP CR_MEAN_PTS_GAP
+ 
++/* Skywave (2026-07-12): reject PCR values whose raw stream time exceeds this
++ * threshold. The 33-bit MPEG-TS PCR base wraps at (2^33-1)/90000 ≈ 95443.7 s
++ * (~26.5 hours). Some Xtream restream transcoders emit an uninitialized PCR
++ * value near this max at splice/resync points (verified strong RC: ECDF
++ * 2026-07-12: a 95443.018 s stale PCR at packet #3 of a 1.8 Mbps live TS,
++ * plus a second splice ~30 s into playback that made VLC's resync path
++ * re-anchor on it — `new clock context(1) @95443017689`, stream_diff
++ * -21387989, VideoToolbox kVTVideoDecoderBadDataErr, permanent freeze).
++ * Any legitimate live stream open advances far below this in one session
++ * (a fresh transcoder starts near 0; even a 24-hour catch-up session sits
++ * comfortably below 90000 s), so raw values above the threshold are almost
++ * certainly stale markers. Reject them at the clock entry — the demux will
++ * feed a normal PCR shortly and the pipeline stays anchored on the real
++ * timeline. */
++#define SKYWAVE_STALE_PCR_THRESHOLD VLC_TICK_FROM_SEC(90000)
++
+ /* Rate (in 1/256) at which we will read faster to try to increase our
+  * internal buffer (if we control the pace of the source).
+  */
+@@ -139,6 +155,10 @@ struct input_clock_t
+     float   rate;
+     vlc_tick_t i_pts_delay;
+     vlc_tick_t i_pause_date;
++
++    /* Skywave: last system-time we warned about a stale-PCR drop, so a
++     * chronic-emit panel doesn't spam VLCLogTap's per-second ceiling. */
++    vlc_tick_t skywave_last_stale_warn;
+ };
+ 
+ static vlc_tick_t ClockStreamToSystem( input_clock_t *, vlc_tick_t i_stream );
+@@ -191,6 +211,7 @@ input_clock_t *input_clock_New(struct vlc_logger *logger, float rate)
+     cl->rate = rate;
+     cl->i_pts_delay = 0;
+     cl->b_paused = false;
++    cl->skywave_last_stale_warn = VLC_TICK_INVALID;
+     cl->i_pause_date = VLC_TICK_INVALID;
+ 
+     return cl;
+@@ -234,6 +255,37 @@ vlc_tick_t input_clock_Update( input_clock_t *cl,
+ 
+     assert( i_ck_stream != VLC_TICK_INVALID && i_ck_system != VLC_TICK_INVALID );
+ 
++    /* Skywave (2026-07-12): drop stale near-max-33-bit PCR values spliced INTO
++     * an ongoing stream (see SKYWAVE_STALE_PCR_THRESHOLD comment). Only fires
++     * once a reference is established — the FIRST PCR at open is allowed
++     * through even if it's stale, because the existing stream_diff<0
++     * discontinuity path handles a stale-then-real startup transition
++     * correctly (2 small time_backwards observed on strong RC: ECDF startup,
++     * plays through cleanly). The actual failure is the LATE re-injection
++     * ~30 s in: b_has_reference is true, cl->last has drifted to a normal
++     * value (~30 s), a fresh 95443 s PCR arrives via ts.c's PSI-resync path
++     * → normally that would trip the discontinuity + re-anchor on the stale
++     * value via SetFirstPcr, freezing the pipeline for the rest of the watch.
++     * Rejecting the sample keeps cl->last on the last-good reference; the
++     * demux's next PCR is normal and playback continues without a
++     * discontinuity. Cheap comparison in the hot path. Warn once every
++     * ~500 ms so a chronic panel's marker rate stays legible in the log
++     * without saturating VLCLogTap's per-second ceiling. */
++    if( cl->b_has_reference && i_ck_stream >= SKYWAVE_STALE_PCR_THRESHOLD )
++    {
++        vlc_tick_t now = i_ck_system;
++        if( cl->skywave_last_stale_warn == VLC_TICK_INVALID
++         || now - cl->skywave_last_stale_warn >= VLC_TICK_FROM_MS(500) )
++        {
++            vlc_warning(cl->logger,
++                        "skywave-stale-pcr: dropping PCR near 33-bit max "
++                        "(value=%"PRId64" us, threshold=%"PRId64" us)",
++                        i_ck_stream, (vlc_tick_t)SKYWAVE_STALE_PCR_THRESHOLD);
++            cl->skywave_last_stale_warn = now;
++        }
++        return 0;
++    }
++
+     if( !cl->b_has_reference )
+     {
+         /* */
+-- 
+2.43.0
+
