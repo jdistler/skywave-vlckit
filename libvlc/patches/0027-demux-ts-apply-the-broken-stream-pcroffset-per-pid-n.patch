@@ -1,0 +1,124 @@
+From 6d2e9f0f0eb969265cd723459ec92ece9a7fbc19 Mon Sep 17 00:00:00 2001
+From: jdistler <josephcd921@gmail.com>
+Date: Mon, 13 Jul 2026 12:11:16 -0500
+Subject: [PATCH] demux: ts: apply the broken-stream pcroffset per-pid, not
+ program-wide
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When one ES's first dts sits >1s below the PCR, ts.c computes i_pcroffset
+(pcrref - dts + 80ms) and adds it to EVERY block of EVERY es in the program.
+Some Xtream loop-channel muxes stamp audio and video with bases minutes apart
+while the content is actually interleaved in real time (fullent coarse-avbase
+class — Charlie's Angels: audio dts = PCR-240s, video dts ≈ PCR). The shared
+offset re-aligned audio but pushed the healthy video 240s into the future:
+the vout wedged holding future-dated frames, decode backpressured to a stop
+after the first GOP, and the user got frozen video with audio playing on for
+the entire watch (round-2 deep panelfuzz finding, 2026-07-13; video decode
+counter froze at 27 frames while audio played 40s).
+
+Decide per-pid on each pid's own first timestamped block: the offset applies
+only if THIS pid's dts is below the PCR (the condition the offset exists to
+repair). Uniformly-late streams — the case the offset was written for — are
+unchanged (every pid qualifies). The MLB tape-delay class is untouched (audio
+dts ABOVE pcr, offset never computed). PCRCheckDTS honors the exemption for
+its queue-drain peek. Marker "skywave-pcroffset-exempt" for VLCLogTap.
+
+Verified under paced replay: video decodes continuously at source rate
+(dec 27-then-frozen -> 769 and climbing), audio unchanged; TRWAM (choppy
+low-rate encode, no pcroffset) unchanged; streamlab regress ALL GREEN.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Co-Authored-By: Happy <yesreply@happy.engineering>
+---
+ modules/demux/mpeg/ts.c                 | 33 +++++++++++++++++++++++--
+ modules/demux/mpeg/ts_streams.c         |  1 +
+ modules/demux/mpeg/ts_streams_private.h |  8 ++++++
+ 3 files changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/modules/demux/mpeg/ts.c b/modules/demux/mpeg/ts.c
+index 72ef1862aa..15cadd774f 100644
+--- a/modules/demux/mpeg/ts.c
++++ b/modules/demux/mpeg/ts.c
+@@ -1734,7 +1734,34 @@ static void ParsePESDataChain( demux_t *p_demux, ts_pid_t *pid, block_t *p_pes,
+                     else p_pmt->pcr.i_pcroffset = 0;
+                 }
+ 
+-                if( p_pmt->pcr.i_pcroffset != -1 )
++                /* Skywave (2026-07-13): the pcroffset above exists to lift a BELOW-PCR
++                 * timeline up to the PCR, but it is computed from ONE es's first block
++                 * and was applied program-wide. Some Xtream loop-channel muxes stamp
++                 * audio and video with bases minutes apart (fullent coarse-avbase class:
++                 * audio dts = PCR-240s, video dts ≈ PCR, content actually interleaved in
++                 * real time) — the shared offset re-aligned audio but pushed the healthy
++                 * video 240s into the future: wedged vout, frozen video, audio playing
++                 * on. Decide per-pid, on the pid's own first timestamped block: the
++                 * offset applies only if THIS pid's dts is below the PCR. Streams whose
++                 * ESes are uniformly late (the case the offset was written for) behave
++                 * as before — every pid qualifies. */
++                if( p_pmt->pcr.i_pcroffset > 0 && p_block->i_dts != VLC_TICK_INVALID &&
++                    i_pcrref != VLC_TICK_INVALID &&
++                    pid->u.p_stream->skywave_pcroffset_mode == -1 )
++                {
++                    if( p_block->i_dts + FROM_SCALE_NZ(1) < i_pcrref )
++                        pid->u.p_stream->skywave_pcroffset_mode = 1;
++                    else
++                    {
++                        pid->u.p_stream->skywave_pcroffset_mode = 0;
++                        msg_Warn( p_demux, "skywave-pcroffset-exempt: pid %d dts is not "
++                                           "below pcr, not applying the program delay",
++                                  pid->i_pid );
++                    }
++                }
++
++                if( p_pmt->pcr.i_pcroffset != -1 &&
++                    pid->u.p_stream->skywave_pcroffset_mode != 0 )
+                 {
+                     if( p_block->i_dts != VLC_TICK_INVALID )
+                         p_block->i_dts += p_pmt->pcr.i_pcroffset;
+@@ -2382,7 +2409,9 @@ static void PCRCheckDTS( demux_t *p_demux, ts_pmt_t *p_pmt, vlc_tick_t i_pcr)
+         if( pesh.i_pts != TS_90KHZ_INVALID )
+             i_pts = TimeStampWrapAround( i_pcr, FROM_SCALE(pesh.i_pts) );
+ 
+-        if (p_pmt->pcr.i_pcroffset > 0) {
++        /* Skywave: honor the per-pid exemption (see the pcroffset decision at the
++         * apply site) — an exempt pid's timestamps are already PCR-coherent. */
++        if (p_pmt->pcr.i_pcroffset > 0 && p_pes->skywave_pcroffset_mode != 0) {
+             if( i_dts != VLC_TICK_INVALID )
+                 i_dts += p_pmt->pcr.i_pcroffset;
+             if( i_pts != VLC_TICK_INVALID )
+diff --git a/modules/demux/mpeg/ts_streams.c b/modules/demux/mpeg/ts_streams.c
+index 114b0d3c17..5f8a938e72 100644
+--- a/modules/demux/mpeg/ts_streams.c
++++ b/modules/demux/mpeg/ts_streams.c
+@@ -280,6 +280,7 @@ ts_stream_t *ts_stream_New( demux_t *p_demux, ts_pmt_t *p_program )
+     pes->prepcr.p_head = NULL;
+     pes->prepcr.pp_last = &pes->prepcr.p_head;
+     pes->i_last_dts = VLC_TICK_INVALID;
++    pes->skywave_pcroffset_mode = -1;
+ 
+     return pes;
+ }
+diff --git a/modules/demux/mpeg/ts_streams_private.h b/modules/demux/mpeg/ts_streams_private.h
+index 55a01759c7..e92133d1d2 100644
+--- a/modules/demux/mpeg/ts_streams_private.h
++++ b/modules/demux/mpeg/ts_streams_private.h
+@@ -152,6 +152,14 @@ struct ts_stream_t
+     } prepcr;
+ 
+     vlc_tick_t i_last_dts;
++
++    /* Skywave: whether the program-wide pcr.i_pcroffset applies to THIS pid.
++     * -1 undecided, 0 exempt, 1 applies. Decided on the pid's first timestamped
++     * block: the offset exists to lift a below-PCR timeline up to the PCR, so a
++     * pid whose own dts is NOT below the PCR must not be shifted (a shared
++     * offset pushed the healthy ES minutes into the future on panels that stamp
++     * audio/video with different bases — frozen video, playing audio). */
++    int8_t skywave_pcroffset_mode;
+ };
+ 
+ typedef struct ts_si_context_t ts_si_context_t;
+-- 
+2.43.0
+
