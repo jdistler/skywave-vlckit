@@ -1,0 +1,144 @@
+From 9518222398ae2de38f3fbe9258b7daab9147183b Mon Sep 17 00:00:00 2001
+From: jdistler <josephcd921@gmail.com>
+Date: Mon, 13 Jul 2026 08:54:56 -0500
+Subject: [PATCH] clock: accept a coherent re-based timeline after 2 consistent
+ rejects
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The stale-PCR guard's blind MAX_STREAK valve (accept after 10 rejects) makes a
+genuine encoder restart expensive: on the side panel's restarts (a garbage
+33-bit-max spike, then PCR+PES re-based to ~0 — see the ts.c demux guard), the
+backward re-base was rejected for 10 samples at the panel's 1.2s PCR cadence,
+i.e. ~12s before re-anchor. The live-cache runway is only ~5s of old-timeline
+content, so the remaining ~7s of new-timeline frames were all dropped too-late:
+position advanced, state stayed Playing, and the user saw frozen video (verified
+under paced replay: 135 vout too-late drops + hundreds of avcodec late-video
+drops before the valve fired).
+
+A genuine re-base is distinguishable from the transient spliced outlier this
+guard exists for (the RC:ECDF class): its rejected samples advance in lockstep
+with system time (each ≈ previous + elapsed×rate), while a transient outlier
+repeats or scatters. Track the last rejected sample; two consecutive coherent
+rejects (≤500ms deviation) → accept the 3rd sample, which falls through to the
+normal discontinuity path and re-anchors immediately (~2.4s after the restart —
+fully covered by the cache runway). Verified under paced replay: displayed-
+pictures counter climbs straight through the splice, zero late/lost drops.
+The blind valve remains as the fallback for incoherent chronic emitters.
+Marker: "skywave-stale-pcr: coherent new timeline after N rejects".
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Co-Authored-By: Happy <yesreply@happy.engineering>
+---
+ src/clock/input_clock.c | 71 +++++++++++++++++++++++++++++++++++------
+ 1 file changed, 61 insertions(+), 10 deletions(-)
+
+diff --git a/src/clock/input_clock.c b/src/clock/input_clock.c
+index 55f357209d..977629c7e1 100644
+--- a/src/clock/input_clock.c
++++ b/src/clock/input_clock.c
+@@ -192,6 +192,16 @@ struct input_clock_t
+     /* Skywave: last system-time we warned about a stale-PCR drop, so a
+      * chronic-emit panel doesn't spam VLCLogTap's per-second ceiling. */
+     vlc_tick_t skywave_last_stale_warn;
++    /* Skywave: the last REJECTED sample (stream+system), plus how many
++     * consecutive rejects have advanced in lockstep with system time. A
++     * genuine encoder-restart re-base produces coherent rejects (each new
++     * sample ≈ previous + elapsed×rate); a transient spliced outlier
++     * (the RC:ECDF class this guard exists for) repeats or scatters. Two
++     * coherent rejects → the 3rd sample re-anchors immediately instead of
++     * waiting out the blind MAX_STREAK valve (which costs ~12s of dropped
++     * video on the side panel's restarts). */
++    clock_point_t skywave_last_reject;
++    unsigned int skywave_coherent_rejects;
+ };
+ 
+ static vlc_tick_t ClockStreamToSystem( input_clock_t *, vlc_tick_t i_stream );
+@@ -246,6 +256,8 @@ input_clock_t *input_clock_New(struct vlc_logger *logger, float rate)
+     cl->b_paused = false;
+     cl->skywave_reject_streak = 0;
+     cl->skywave_last_stale_warn = VLC_TICK_INVALID;
++    cl->skywave_last_reject = clock_point_Create( VLC_TICK_INVALID, VLC_TICK_INVALID );
++    cl->skywave_coherent_rejects = 0;
+     cl->i_pause_date = VLC_TICK_INVALID;
+ 
+     return cl;
+@@ -316,25 +328,64 @@ vlc_tick_t input_clock_Update( input_clock_t *cl,
+         vlc_tick_t abs_jump = jump < 0 ? -jump : jump;
+         if( abs_jump > bound )
+         {
+-            vlc_tick_t now = i_ck_system;
+-            if( cl->skywave_last_stale_warn == VLC_TICK_INVALID
+-             || now - cl->skywave_last_stale_warn >= VLC_TICK_FROM_MS(500) )
++            /* Coherence check: a GENUINE clock re-base (encoder restart — the
++             * side panel does this behind a garbage 33-bit-max spike) produces
++             * consecutive rejected samples that advance in lockstep with system
++             * time; a transient spliced outlier (the RC:ECDF class) repeats or
++             * scatters. Two coherent rejects → accept the 3rd sample and
++             * re-anchor NOW instead of waiting out the blind MAX_STREAK valve
++             * (10 samples ≈ 12s of dropped video at the side panel's 1.2s PCR
++             * cadence — the live-cache runway is only ~5s, so the valve alone
++             * leaves ~7s of user-visible freeze after every restart). */
++            if( cl->skywave_reject_streak > 0
++             && cl->skywave_last_reject.stream != VLC_TICK_INVALID )
++            {
++                vlc_tick_t expected = cl->skywave_last_reject.stream +
++                    (vlc_tick_t)((i_ck_system - cl->skywave_last_reject.system) * cl->rate);
++                vlc_tick_t dev = i_ck_stream - expected;
++                if( dev < 0 ) dev = -dev;
++                if( dev <= VLC_TICK_FROM_MS(500) )
++                    cl->skywave_coherent_rejects++;
++                else
++                    cl->skywave_coherent_rejects = 0;
++            }
++
++            if( cl->skywave_coherent_rejects >= 2 )
+             {
+                 vlc_warning(cl->logger,
+-                            "skywave-stale-pcr: dropping outlier PCR "
+-                            "(jump=%"PRId64" us, streak=%u, incoming=%"PRId64" us, last=%"PRId64" us)",
+-                            jump, cl->skywave_reject_streak + 1,
+-                            i_ck_stream, cl->last.stream);
+-                cl->skywave_last_stale_warn = now;
++                            "skywave-stale-pcr: coherent new timeline after "
++                            "%u rejects, re-anchoring (incoming=%"PRId64" us, last=%"PRId64" us)",
++                            cl->skywave_reject_streak, i_ck_stream, cl->last.stream);
++                /* fall through — the sample proceeds into the normal
++                 * discontinuity path below, which re-anchors the reference */
++            }
++            else
++            {
++                vlc_tick_t now = i_ck_system;
++                if( cl->skywave_last_stale_warn == VLC_TICK_INVALID
++                 || now - cl->skywave_last_stale_warn >= VLC_TICK_FROM_MS(500) )
++                {
++                    vlc_warning(cl->logger,
++                                "skywave-stale-pcr: dropping outlier PCR "
++                                "(jump=%"PRId64" us, streak=%u, incoming=%"PRId64" us, last=%"PRId64" us)",
++                                jump, cl->skywave_reject_streak + 1,
++                                i_ck_stream, cl->last.stream);
++                    cl->skywave_last_stale_warn = now;
++                }
++                cl->skywave_reject_streak++;
++                cl->skywave_last_reject = clock_point_Create( i_ck_system, i_ck_stream );
++                return 0;
+             }
+-            cl->skywave_reject_streak++;
+-            return 0;
+         }
+         cl->skywave_reject_streak = 0;
++        cl->skywave_coherent_rejects = 0;
++        cl->skywave_last_reject = clock_point_Create( VLC_TICK_INVALID, VLC_TICK_INVALID );
+     }
+     else
+     {
+         cl->skywave_reject_streak = 0;
++        cl->skywave_coherent_rejects = 0;
++        cl->skywave_last_reject = clock_point_Create( VLC_TICK_INVALID, VLC_TICK_INVALID );
+     }
+ 
+     if( !cl->b_has_reference )
+-- 
+2.43.0
+
