@@ -1,0 +1,133 @@
+From bdb49dc242e5580c3e3147b7ae526b8ed5da8a2e Mon Sep 17 00:00:00 2001
+From: jdistler <josephcd921@gmail.com>
+Date: Mon, 13 Jul 2026 07:46:19 -0500
+Subject: [PATCH] demux: ts: drop garbage 33-bit-max PCR spike before it
+ poisons the wrap reference
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Some Xtream transcoders (the 'side' panel, verified 2026-07-13) emit ONE spurious
+PCR at the 33-bit maximum (~95443s) at an encoder restart, then reset the real
+PCR+PES down to ~0. PCRHandle wraps each incoming PCR against pcr.i_current, so the
+spike poisons that reference to the max value; the subsequent 0-based reset then
+looks like a 33-bit rollover (delta >= half-roll) and TimeStampWrapAround unwraps
+ONLY the PCR to ~95443s+. The PES PTS wrap against pcr.i_first instead, so they stay
+near 0 — leaving PCR and PES ~95443s apart. Every frame is then "95443s late",
+dropped forever: the pipeline freezes permanently (observed on the side panel as a
+hard freeze 11-23s into every channel, with perpetual clock re-referencing).
+
+The input_clock guard (0023) cannot help — the poison happens here in the demux,
+upstream of the clock. Fix it at the source: in PCRHandle, when this pid drives the
+program's PCR, drop a large FORWARD outlier jump from the last-good value before it
+updates pcr.i_current. Backward jumps are left untouched — those are legitimate
+33-bit wraps (handled by TimeStampWrapAround) or encoder restarts (handled
+downstream) — so the real 0-based reset then wraps against the last-good value (39s)
+instead of the poisoned max, and PES/PCR stay coherent on the new timeline. Verified
+under paced (device-representative) replay: all nine frozen side captures now play
+through the splice, recovering with a brief stale-frame flush and end-state Playing.
+
+Safety valve: force-accept after SKYWAVE_TS_MAX_REJECT_STREAK so a genuine long
+forward splice isn't blocked forever. FWD bound 60s matches 0023 (a sparse-PCR loop
+channel legitimately steps 10-60s). Marker "skywave-ts-pcr-spike" for VLCLogTap.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Co-Authored-By: Happy <yesreply@happy.engineering>
+---
+ modules/demux/mpeg/ts.c                 | 44 +++++++++++++++++++++++++
+ modules/demux/mpeg/ts_streams.c         |  1 +
+ modules/demux/mpeg/ts_streams_private.h |  4 +++
+ 3 files changed, 49 insertions(+)
+
+diff --git a/modules/demux/mpeg/ts.c b/modules/demux/mpeg/ts.c
+index 77577faa27..72ef1862aa 100644
+--- a/modules/demux/mpeg/ts.c
++++ b/modules/demux/mpeg/ts.c
+@@ -63,6 +63,15 @@
+ 
+ #include <assert.h>
+ 
++/* Skywave: bounds for the garbage forward-outlier PCR spike guard in PCRHandle.
++ * Mirrors the input_clock.c stale-PCR guard (patch 0023) one layer earlier, at the
++ * demux, so a spurious near-33-bit-max PCR can't poison pcr.i_current (the wrap
++ * reference) and desync the PES/PCR timelines. FWD 60s matches 0023's forward bound
++ * (a sparse-PCR loop channel legitimately steps 10-60s); the streak valve force-
++ * accepts after N so a genuine long forward splice isn't blocked forever. */
++#define SKYWAVE_TS_MAX_PCR_JUMP_FWD  VLC_TICK_FROM_SEC(60)
++#define SKYWAVE_TS_MAX_REJECT_STREAK 10
++
+ /*****************************************************************************
+  * Module descriptor
+  *****************************************************************************/
+@@ -2422,6 +2431,41 @@ static void PCRHandle( demux_t *p_demux, ts_pid_t *pid, ts_90khz_t i_pcr )
+ 
+         vlc_tick_t i_program_pcr = TimeStampWrapAround( i_past_pcr, FROM_SCALE(i_pcr) );
+ 
++        /* Does this pid drive THIS program's PCR? (dedicated PCR pid, or — when the
++         * program declares no dedicated PCR pid — a pid it references directly.) */
++        bool b_is_program_pcr =
++            ( p_pmt->i_pid_pcr == 0x1FFF )
++                ? PIDReferencedByProgram( p_pmt, pid->i_pid )
++                : ( p_pmt->i_pid_pcr == pid->i_pid );
++
++        /* Skywave (2026-07-13): drop a garbage forward-outlier PCR spike before it
++         * updates pcr.i_current. Some Xtream transcoders emit ONE spurious PCR at the
++         * 33-bit maximum (~95443s) at an encoder restart, then reset the real PCR+PES
++         * to ~0. PCRHandle wraps the next PCR against pcr.i_current (now the poisoned
++         * max) while PES wrap against pcr.i_first, so the demux false-detects the
++         * 0-based reset as a 33-bit rollover and unwraps ONLY the PCR to ~95443s+,
++         * leaving PES near 0 — a permanent ~95443s divergence that freezes the pipeline
++         * (verified on the 'side' panel: every stream froze 11-23s in; the input_clock
++         * guard 0023 can't help because the poison happens here, upstream of it).
++         * Reject only a large FORWARD jump from the last-good value; backward jumps are
++         * legitimate 33-bit wraps (handled by TimeStampWrapAround) or encoder restarts
++         * (handled downstream), so they pass. Safety valve: force-accept after a streak
++         * so a genuine long forward splice isn't blocked forever. */
++        if( b_is_program_pcr && p_pmt->pcr.i_current != VLC_TICK_INVALID )
++        {
++            if( p_pmt->pcr.skywave_pcr_reject_streak < SKYWAVE_TS_MAX_REJECT_STREAK
++             && i_program_pcr - p_pmt->pcr.i_current > SKYWAVE_TS_MAX_PCR_JUMP_FWD )
++            {
++                msg_Warn( p_demux, "skywave-ts-pcr-spike: dropping outlier PCR "
++                          "%"PRId64" -> %"PRId64" (streak=%u)",
++                          p_pmt->pcr.i_current, i_program_pcr,
++                          p_pmt->pcr.skywave_pcr_reject_streak + 1 );
++                p_pmt->pcr.skywave_pcr_reject_streak++;
++                continue;
++            }
++            p_pmt->pcr.skywave_pcr_reject_streak = 0;
++        }
++
+         if( p_pmt->i_pid_pcr == 0x1FFF ) /* That program has no dedicated PCR pid ISO/IEC 13818-1 2.4.4.9 */
+         {
+             if( PIDReferencedByProgram( p_pmt, pid->i_pid ) ) /* PCR shall be on pid itself */
+diff --git a/modules/demux/mpeg/ts_streams.c b/modules/demux/mpeg/ts_streams.c
+index d32ff77f42..114b0d3c17 100644
+--- a/modules/demux/mpeg/ts_streams.c
++++ b/modules/demux/mpeg/ts_streams.c
+@@ -116,6 +116,7 @@ ts_pmt_t *ts_pmt_New( demux_t *p_demux )
+     pmt->pcr.b_disable = false;
+     pmt->pcr.i_first_dts = VLC_TICK_INVALID;
+     pmt->pcr.i_pcroffset = -1;
++    pmt->pcr.skywave_pcr_reject_streak = 0;
+ 
+     pmt->pcr.b_fix_done = false;
+ 
+diff --git a/modules/demux/mpeg/ts_streams_private.h b/modules/demux/mpeg/ts_streams_private.h
+index 03b3db17c0..55a01759c7 100644
+--- a/modules/demux/mpeg/ts_streams_private.h
++++ b/modules/demux/mpeg/ts_streams_private.h
+@@ -66,6 +66,10 @@ struct ts_pmt_t
+         vlc_tick_t i_pcroffset;
+         bool    b_disable; /* ignore PCR field, use dts */
+         bool    b_fix_done;
++        /* Skywave: consecutive forward-outlier PCR spikes dropped by the
++         * garbage-spike guard in PCRHandle (a single spurious near-33-bit-max
++         * PCR that would otherwise poison i_current's wrap reference). */
++        unsigned skywave_pcr_reject_streak;
+     } pcr;
+ 
+     struct
+-- 
+2.43.0
+
