@@ -1,0 +1,73 @@
+From fd2e65ca3193d07f546930369df2ec83fece2aad Mon Sep 17 00:00:00 2001
+From: jdistler <josephcd921@gmail.com>
+Date: Sun, 12 Jul 2026 22:52:12 -0500
+Subject: [PATCH 3/3] demux: cap avdiff tape-delay compensation to a plausible
+ 60s window
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Patch 0022 fired on abs(first-audio-video PES PTS diff) >= 3s with no upper
+bound, so a coarse PTS-base mismatch triggered a bogus multi-second audio_delay.
+panelfuzz wild-campaign 2026-07-12: fullent's 24/7 loop channels (The Rifleman,
+Sesame Street) stamp video and audio in eras ~105s apart though the content
+plays together; es_out.c set audio_delay=+105s, which would delay audio past
+its own span into silence. A broadcast compliance buffer (the real tape-delay,
+MLB +36s) is seconds to tens of seconds; >60s is a labeling artifact. Both
+0022 sites (es_out.c raw TS + FakeESOut.cpp adaptive HLS) now gate 3s<=|diff|<=60s
+— above the cap: no correction, no marker (the app pill must not mount a 100s
+countdown), let the monotonic clock play the co-arriving frames together.
+
+Verified: The Rifleman (-105s) no longer fires; MLB (+36s) still fires + compensates.
+
+skywave-audio-tolerance branch.
+---
+ modules/demux/adaptive/plumbing/FakeESOut.cpp |  7 ++++++-
+ src/input/es_out.c                            | 13 ++++++++++++-
+ 2 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/modules/demux/adaptive/plumbing/FakeESOut.cpp b/modules/demux/adaptive/plumbing/FakeESOut.cpp
+index a794097bef..ac9c854fd0 100644
+--- a/modules/demux/adaptive/plumbing/FakeESOut.cpp
++++ b/modules/demux/adaptive/plumbing/FakeESOut.cpp
+@@ -731,7 +731,12 @@ int FakeESOut::esOutSend(es_out_id_t *p_es, block_t *p_block)
+         {
+             const vlc_tick_t diff = sk_first_audio_pts - sk_first_video_pts;
+             const vlc_tick_t abs_diff = diff < 0 ? -diff : diff;
+-            if( abs_diff >= VLC_TICK_FROM_SEC(3) )
++            /* Same plausible-tape-delay window as the es_out.c peer: 3-60 s.
++             * Beyond 60 s is a coarse PTS-base mismatch (loop channels), not a
++             * real delay — the app pill must not mount a 100 s countdown for it,
++             * so don't even fire the marker there. */
++            if( abs_diff >= VLC_TICK_FROM_SEC(3)
++             && abs_diff <= VLC_TICK_FROM_SEC(60) )
+             {
+                 if( sk_log_obj )
+                     msg_Warn( sk_log_obj,
+diff --git a/src/input/es_out.c b/src/input/es_out.c
+index 7736e49840..6f8c49dbf0 100644
+--- a/src/input/es_out.c
++++ b/src/input/es_out.c
+@@ -3210,7 +3210,18 @@ static int EsOutSend(es_out_t *out, es_out_id_t *es, block_t *p_block )
+             const vlc_tick_t diff = p_sys->skywave_first_audio_pts
+                                   - p_sys->skywave_first_video_pts;
+             const vlc_tick_t abs_diff = diff < 0 ? -diff : diff;
+-            if( abs_diff >= VLC_TICK_FROM_SEC(3) )
++            /* Compensate only within a plausible tape-delay window. A broadcast
++             * compliance buffer is seconds to a few tens of seconds (MLB Network
++             * +36s); anything past ~60s is NOT a temporal offset but a coarse
++             * PTS-BASE mismatch — e.g. fullent's 24/7 loop channels (The
++             * Rifleman, Sesame Street) stamp video and audio in eras ~105s
++             * apart though the content plays together (panelfuzz campaign,
++             * 2026-07-12). Applying a 105s audio_delay there would ACTIVELY
++             * break sync (delay audio past its own span into silence). Above
++             * the cap we do nothing and let the monotonic clock play the
++             * co-arriving frames together, which is already correct. */
++            if( abs_diff >= VLC_TICK_FROM_SEC(3)
++             && abs_diff <= VLC_TICK_FROM_SEC(60) )
+             {
+                 msg_Warn( p_input,
+                     "skywave-avdiff-large: first audio-video PES PTS diff "
+-- 
+2.43.0
+

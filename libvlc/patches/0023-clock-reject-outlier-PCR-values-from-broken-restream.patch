@@ -1,7 +1,7 @@
-From c12bbf872bc7606282895883506da6f3d8be702d Mon Sep 17 00:00:00 2001
+From 25f7c95d349209ab05e46d3c94950b4afbf51661 Mon Sep 17 00:00:00 2001
 From: jdistler <josephcd921@gmail.com>
-Date: Sun, 12 Jul 2026 07:54:15 -0500
-Subject: [PATCH] clock: reject outlier PCR values from broken restream
+Date: Sun, 12 Jul 2026 08:19:33 -0500
+Subject: [PATCH 2/3] clock: reject outlier PCR values from broken restream
  transcoders
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -28,30 +28,30 @@ the initial latch. Only a JUMP relative to the running reference cleanly
 distinguishes the outlier from the continuous timeline.
 
 Reproduced end-to-end via harness + captured stream + synthetic stale-PCR
-re-injection. Vanilla libvlc fires 'clock gap ... stream_diff: -21387989',
-'new clock context(1) @95443017689', 'Using a new clock context (1),
-flushing static filters' — the exact on-device signature. Patched drops the
-sample under 'skywave-stale-pcr: dropping outlier PCR' and playback stays
-anchored on the last-good reference.
+re-injection. Vanilla libvlc fires 'clock gap ... stream_diff: -5671989',
+'new clock context(1) @95443017689', 'flushing static filters' on a spike
+injected into a normal timeline. Patched drops the sample under
+'skywave-stale-pcr: dropping outlier PCR' and playback stays anchored on the
+last-good reference.
 
 Warn is rate-limited to once/500 ms so a chronic panel's rate stays legible
 in VLCLogTap without saturating its per-second ceiling.
 
 skywave-audio-tolerance branch.
 ---
- src/clock/input_clock.c | 85 +++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 85 insertions(+)
+ src/clock/input_clock.c | 103 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 103 insertions(+)
 
 diff --git a/src/clock/input_clock.c b/src/clock/input_clock.c
-index 01d873b679..593dbd861f 100644
+index 01d873b679..55f357209d 100644
 --- a/src/clock/input_clock.c
 +++ b/src/clock/input_clock.c
-@@ -85,6 +85,35 @@
+@@ -85,6 +85,51 @@
  
  #define CR_MAX_GAP CR_MEAN_PTS_GAP
  
 +/* Skywave (2026-07-12): drop an incoming PCR whose stream time jumps by more
-+ * than SKYWAVE_MAX_PCR_JUMP from the running reference. Some Xtream restream
++ * than the direction-dependent SKYWAVE_MAX_PCR_JUMP_* bound from the running reference. Some Xtream restream
 + * transcoders splice a stale near-max-33-bit PCR value into an ongoing stream
 + * at random moments (verified strong RC: ECDF 2026-07-12: 30 s of clean PCRs
 + * near 95443 s, then a fresh 95443 s marker mid-play makes stream_diff jump
@@ -71,18 +71,34 @@ index 01d873b679..593dbd861f 100644
 + *     cl->last stays on the last-good reference at ~95464 s, next real PCR
 + *     is normal, playback continues without a discontinuity.
 + *
-+ * Legitimate content splices (ad break, scene change) rarely exceed 3 s of
-+ * PES/PCR jump; a 10 s guard keeps us clear of the noise floor. The streak
-+ * safety valve prevents a lockout if a panel genuinely does move its clock
-+ * base far (e.g. session boundary): after MAX_STREAK rejects in a row, the
-+ * next sample is accepted and the reference re-anchors normally. */
-+#define SKYWAVE_MAX_PCR_JUMP  VLC_TICK_FROM_SEC(10)
++ * The guard is ASYMMETRIC by direction (refined 2026-07-12 after the
++ * panelfuzz wild-campaign found the forward false-positive):
++ *   - BACKWARD (stream_diff < 0): a live PCR never legitimately goes back in
++ *     time by seconds — that is always a rewind / stale value / restream
++ *     restart. Reject beyond a tight 10 s (well clear of the 300 ms CR_MAX_GAP
++ *     jitter floor). This is the RC: ECDF -21 s case.
++ *   - FORWARD (stream_diff > 0): a sparse-PCR channel (fullent's 24/7 loop
++ *     channels: MASH, Charlies Angels, …) legitimately steps its PCR forward
++ *     by seconds-to-tens-of-seconds between samples, and a genuine mid-stream
++ *     gap (panel pauses then resumes) is also a real forward jump — those must
++ *     pass to VLC's normal discontinuity handling, NOT be dropped (dropping a
++ *     legit forward step strands cl->last behind and hiccups the next frame).
++ *     Only reject FORWARD jumps large enough to be an uninitialized/stale
++ *     marker: the observed stale values sit near the 33-bit max (~95 443 s),
++ *     so a 60 s forward bound cleanly separates "sparse gap" (< 60 s, allow)
++ *     from "stale splice" (huge, drop) while still catching the
++ *     re-injection-onto-an-established-timeline case.
++ * The streak safety valve prevents a lockout if a panel genuinely does move
++ * its clock base far (session boundary): after MAX_STREAK rejects in a row,
++ * the next sample is accepted and the reference re-anchors normally. */
++#define SKYWAVE_MAX_PCR_JUMP_BACK  VLC_TICK_FROM_SEC(10)
++#define SKYWAVE_MAX_PCR_JUMP_FWD   VLC_TICK_FROM_SEC(60)
 +#define SKYWAVE_MAX_REJECT_STREAK  10
 +
  /* Rate (in 1/256) at which we will read faster to try to increase our
   * internal buffer (if we control the pace of the source).
   */
-@@ -139,6 +168,14 @@ struct input_clock_t
+@@ -139,6 +184,14 @@ struct input_clock_t
      float   rate;
      vlc_tick_t i_pts_delay;
      vlc_tick_t i_pause_date;
@@ -97,7 +113,7 @@ index 01d873b679..593dbd861f 100644
  };
  
  static vlc_tick_t ClockStreamToSystem( input_clock_t *, vlc_tick_t i_stream );
-@@ -191,6 +228,8 @@ input_clock_t *input_clock_New(struct vlc_logger *logger, float rate)
+@@ -191,6 +244,8 @@ input_clock_t *input_clock_New(struct vlc_logger *logger, float rate)
      cl->rate = rate;
      cl->i_pts_delay = 0;
      cl->b_paused = false;
@@ -106,12 +122,12 @@ index 01d873b679..593dbd861f 100644
      cl->i_pause_date = VLC_TICK_INVALID;
  
      return cl;
-@@ -234,6 +273,52 @@ vlc_tick_t input_clock_Update( input_clock_t *cl,
+@@ -234,6 +289,54 @@ vlc_tick_t input_clock_Update( input_clock_t *cl,
  
      assert( i_ck_stream != VLC_TICK_INVALID && i_ck_system != VLC_TICK_INVALID );
  
 +    /* Skywave (2026-07-12): drop an outlier PCR sample spliced INTO an
-+     * ongoing stream (see SKYWAVE_MAX_PCR_JUMP comment). Only fires once a
++     * ongoing stream (see the SKYWAVE_MAX_PCR_JUMP_* comment). Only fires once a
 +     * reference is established — the FIRST PCR at open is allowed through
 +     * unconditionally so the existing stream_diff<0 discontinuity path can
 +     * handle a stale-then-real startup transition. The actual failure mode
@@ -132,8 +148,10 @@ index 01d873b679..593dbd861f 100644
 +     && cl->skywave_reject_streak < SKYWAVE_MAX_REJECT_STREAK )
 +    {
 +        vlc_tick_t jump = i_ck_stream - cl->last.stream;
++        vlc_tick_t bound = jump < 0 ? SKYWAVE_MAX_PCR_JUMP_BACK
++                                    : SKYWAVE_MAX_PCR_JUMP_FWD;
 +        vlc_tick_t abs_jump = jump < 0 ? -jump : jump;
-+        if( abs_jump > SKYWAVE_MAX_PCR_JUMP )
++        if( abs_jump > bound )
 +        {
 +            vlc_tick_t now = i_ck_system;
 +            if( cl->skywave_last_stale_warn == VLC_TICK_INVALID
