@@ -1,0 +1,161 @@
+From c7dac9298c1db781498cca68ac65f80a5ff41909 Mon Sep 17 00:00:00 2001
+From: jdistler <josephcd921@gmail.com>
+Date: Mon, 13 Jul 2026 14:30:07 -0500
+Subject: [PATCH] demux: survive garbage 33-bit-max first PCR + PCR-starved
+ force-playlist re-anchor
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The first HLS panelfuzz round found 6 fullent channels persistently freezing
+video ~10s in over HLS (audio playing on, state Playing forever) while the same
+channels play clean over raw TS. Two stacked defects, fixed together
+(hls-investigation-log Iteration S; deterministic repro:
+streamlab server.py snapshot + fullent/dailyshow-hls-snapshot):
+
+1. ts.c PCRHandle: the transcoder family stamps ~0x1FFFFFFFF (~95443s) as the
+   FIRST PCR of a session/segment while the PES timeline starts near 0 (fullent
+   HLS seg0: PCR=8589871592, PES=0.13s — the same garbage value the side/trex
+   guards 0025/0026 handle mid-stream). Latched as the reference it poisons the
+   era: the next real PCR false-unwraps to 95443s+, and stock VLC only survives
+   via the pcroffset kludge (+95443s on every block), which composes fatally
+   with adaptive-ts-force-playlist. Drop a near-max FIRST sample once
+   (marker "skywave-ts-pcr-spike: dropping near-max FIRST PCR"); a genuine
+   about-to-wrap stream emits near-max again immediately and latches on the
+   second sample (one harmless drop; verified: bloomberg-pcr-wrap unchanged).
+   Raw-TS opens pre-latch pcr.i_first in the open-time probe, so this guard
+   engages on the probe-less adaptive inner demux — where the bug lives —
+   leaving validated raw-TS behavior untouched.
+
+2. FakeESOut forceContinuity (adaptive-ts-force-playlist): the continuation
+   high-water advanced ONLY on PCR, but on a PCR-starved mux (~1 PCR per 10s
+   segment — and seg0's only PCR was the dropped garbage) it stagnated while
+   seconds of ES flowed; the next segment's legitimate PCR then looked like a
+   >1s forward discontinuity against the stale mark and spuriously re-anchored
+   BACKWARD, mapping the new segment onto the already-played range — every
+   frame discarded as past. New fp_last_any (all-outputs high-water) is used
+   for the jump test and as the re-anchor target floor; fp_last_out stays
+   PCR-driven for per-sample semantics (the earlier per-ES re-anchor runaway
+   stays fixed).
+
+Also fixed en route (same wedge, earlier layer): the es_out forced-rebuffer
+reset (late PCR > jitter) killed the pipeline unrecoverably; with these two
+fixes the adaptive pipeline never runs just-in-time on this shape, the late-PCR
+path never triggers, and the repro plays 48s flawlessly (dec/disp lockstep,
+zero lost, zero resets — was: wedge at 10.6s, 110 lost, dead recovery).
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Co-Authored-By: Happy <yesreply@happy.engineering>
+---
+ modules/demux/adaptive/plumbing/FakeESOut.cpp | 32 ++++++++++++++++---
+ modules/demux/adaptive/plumbing/FakeESOut.hpp |  3 ++
+ modules/demux/mpeg/ts.c                       | 25 +++++++++++++++
+ 3 files changed, 56 insertions(+), 4 deletions(-)
+
+diff --git a/modules/demux/adaptive/plumbing/FakeESOut.cpp b/modules/demux/adaptive/plumbing/FakeESOut.cpp
+index ac9c854fd0..54154779da 100644
+--- a/modules/demux/adaptive/plumbing/FakeESOut.cpp
++++ b/modules/demux/adaptive/plumbing/FakeESOut.cpp
+@@ -617,11 +617,31 @@ vlc_tick_t FakeESOut::forceContinuity(vlc_tick_t ts, bool reanchor)
+     if(reanchor)
+     {
+         vlc_tick_t cand = ts + fp_offset;
+-        if(cand < fp_last_out || cand - fp_last_out > FP_DISCONTINUITY)
++        /* Two direction-specific marks (2026-07-13, the fullent HLS wedge):
++         * - BACKWARD test stays against fp_last_out (the PCR high-water): a normal
++         *   in-order PCR always trails the leading ES by its natural lead, so
++         *   testing backward against the all-outputs mark re-anchors on EVERY
++         *   sample — the runaway drift documented below.
++         * - FORWARD test runs against fp_last_any (the all-outputs high-water):
++         *   on a PCR-STARVED mux (fullent HLS: ~1 PCR per 10s segment — and the
++         *   first one can be the dropped 33-bit-max garbage, leaving a whole
++         *   segment with NO PCR at all) fp_last_out stagnates while seconds of ES
++         *   flow; the next segment's legitimate PCR then looked like a >1s forward
++         *   "discontinuity" against the stale PCR mark and spuriously re-anchored
++         *   BACKWARD, mapping the new segment onto the already-played range —
++         *   every frame discarded as past, video dead while audio played on. */
++        vlc_tick_t fwdmark = (fp_last_any != VLC_TICK_INVALID && fp_last_any > fp_last_out)
++                           ? fp_last_any : fp_last_out;
++        if(cand < fp_last_out || cand - fwdmark > FP_DISCONTINUITY)
+         {
+             /* Segment-boundary PTS reset: continue the output right after the last
+-             * frame so the clock never jumps. (gap 0 => non-decreasing.) */
+-            fp_offset = fp_last_out - ts;
++             * frame so the clock never jumps. (gap 0 => non-decreasing.) The target
++             * is the all-outputs mark: on a PCR-starved mux the PCR-only point can
++             * sit a whole segment behind the emitted timeline, and continuing from
++             * there would collide with already-played output. Worst case vs the
++             * PCR-only target is a one-time forward step of the leading ES's
++             * natural lead — bounded, unlike per-ES re-anchoring (see below). */
++            fp_offset = fwdmark - ts;
+         }
+     }
+     vlc_tick_t out = ts + fp_offset;
+@@ -631,9 +651,13 @@ vlc_tick_t FakeESOut::forceContinuity(vlc_tick_t ts, bool reanchor)
+      * continue from whichever ES is furthest ahead, dragging the clock forward and the other
+      * ES behind — a runaway A/V divergence (audio races seconds ahead → "playing silence"
+      * waves; video falls seconds behind → "picture too late"). Tracking the PCR alone keeps
+-     * each ES at its natural lead/lag relative to the clock, so A/V stay locked. */
++     * each ES at its natural lead/lag relative to the clock, so A/V stay locked.
++     * fp_last_any additionally tracks EVERY output (ES included) — used only by the
++     * jump test / re-anchor target above, never to drive per-sample re-anchoring. */
+     if(reanchor && out > fp_last_out)
+         fp_last_out = out;
++    if(fp_last_any == VLC_TICK_INVALID || out > fp_last_any)
++        fp_last_any = out;
+     return out;
+ }
+ 
+diff --git a/modules/demux/adaptive/plumbing/FakeESOut.hpp b/modules/demux/adaptive/plumbing/FakeESOut.hpp
+index b6dc2cdaff..ef57dd0c73 100644
+--- a/modules/demux/adaptive/plumbing/FakeESOut.hpp
++++ b/modules/demux/adaptive/plumbing/FakeESOut.hpp
+@@ -164,6 +164,9 @@ namespace adaptive
+             bool fp_have_ref = false;
+             vlc_tick_t fp_offset = 0;
+             vlc_tick_t fp_last_out = VLC_TICK_INVALID;
++            /* all-outputs high-water (ES included) — jump-test/re-anchor-target
++             * only, never drives per-sample re-anchoring (see forceContinuity) */
++            vlc_tick_t fp_last_any = VLC_TICK_INVALID;
+             /* Skywave (patch 0022): audio-video PES PTS offset detector +
+              * compensator (adaptive/HLS side). Peer to the es_out.c detector but
+              * ESSENTIAL for HLS because audio blocks with far-future PTS sit in
+diff --git a/modules/demux/mpeg/ts.c b/modules/demux/mpeg/ts.c
+index 15cadd774f..26058bd4a5 100644
+--- a/modules/demux/mpeg/ts.c
++++ b/modules/demux/mpeg/ts.c
+@@ -2467,6 +2467,31 @@ static void PCRHandle( demux_t *p_demux, ts_pid_t *pid, ts_90khz_t i_pcr )
+                 ? PIDReferencedByProgram( p_pmt, pid->i_pid )
+                 : ( p_pmt->i_pid_pcr == pid->i_pid );
+ 
++        /* Skywave (2026-07-13, round 3): drop a garbage near-33-bit-max FIRST PCR.
++         * The same transcoder family stamps ~0x1FFFFFFFF (~95443s) as the very first
++         * PCR of a session/segment while the PES timeline starts near 0 (fullent HLS
++         * seg0: PCR=8589871592, PES≈0.1s; also the widespread pcr-near-max-start
++         * shape on raw TS). Latched as the reference it poisons everything: the next
++         * real PCR (~9s) false-unwraps to the 95443s era, PES/PCR diverge by 26h, and
++         * stock VLC only survives via the pcroffset kludge (+95443s to every block) —
++         * which composes fatally with :adaptive-ts-force-playlist on HLS (the es_out
++         * forced-rebuffer wedge, hls-investigation-log Iteration S). A LEGITIMATE
++         * stream lands this close to the wrap point with ~1/3000 odds and then keeps
++         * emitting near-max PCRs (it wraps within seconds) — so: drop a near-max
++         * FIRST sample once; if the NEXT sample is also near-max (a genuine
++         * about-to-wrap stream), it latches normally, costing one harmless sample. */
++        if( b_is_program_pcr
++         && p_pmt->pcr.i_current == VLC_TICK_INVALID
++         && p_pmt->pcr.i_first == VLC_TICK_INVALID
++         && p_pmt->pcr.skywave_pcr_reject_streak == 0
++         && i_pcr > (ts_90khz_t)0x1FFFFFFFF - 30 * 90000 )
++        {
++            msg_Warn( p_demux, "skywave-ts-pcr-spike: dropping near-max FIRST PCR "
++                      "%"PRId64" (33-bit ceiling garbage)", (int64_t)i_pcr );
++            p_pmt->pcr.skywave_pcr_reject_streak++;
++            continue;
++        }
++
+         /* Skywave (2026-07-13): drop a garbage forward-outlier PCR spike before it
+          * updates pcr.i_current. Some Xtream transcoders emit ONE spurious PCR at the
+          * 33-bit maximum (~95443s) at an encoder restart, then reset the real PCR+PES
+-- 
+2.43.0
+
