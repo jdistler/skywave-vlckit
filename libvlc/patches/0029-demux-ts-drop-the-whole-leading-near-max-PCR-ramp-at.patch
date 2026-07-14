@@ -1,0 +1,120 @@
+From 2f8d0ef92ed5fb746455007e158bca38bdc59e00 Mon Sep 17 00:00:00 2001
+From: jdistler <josephcd921@gmail.com>
+Date: Tue, 14 Jul 2026 02:00:16 -0500
+Subject: [PATCH] demux: ts: drop the whole leading near-max-PCR ramp at open,
+ not just one
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The final sweep (fuzz6, 2026-07-14) found 20+ fullent loop channels freezing
+video at the initial GOP over raw TS (audio playing on) — dec/disp stuck at
+~85 while get_time advanced and the player stayed Playing. Patch 0028's
+first-PCR guard was ONE-SHOT (skywave_pcr_reject_streak==0): it assumed the
+33-bit-ceiling garbage was a single spike. But these transcoders emit a RAMP —
+9 consecutive ceiling PCRs (95443.0 -> 95443.7 stepping ~0.1s) before resetting
+to the real 0-based timeline. The guard dropped only the first; the SECOND ramp
+sample latched pcr.i_first=95443s, and the broken-stream pcroffset (fed the
+garbage via the PES gather's i_append_pcr = TO_SCALE(pcr.i_current)) then
+computed +95443s and pushed VIDEO 26h into the future — held by the vout
+forever while audio (exempt by 0027) played on.
+
+Keep dropping the leading near-max PCRs until the real timeline arrives, capped
+at SKYWAVE_TS_FIRSTPCR_MAX_DROPS (16, comfortably over the observed 9-ramp) so
+a genuine about-to-wrap open (astronomically rare, and self-healing on its own
+wrap) isn't blocked forever. Dedicated counter skywave_firstpcr_drops so the
+mid-stream forward-spike guard's streak stays clean. Verified live on the
+affected channels (frozen-at-85 -> 676 pictures and climbing, zero bogus
+delay); regression fixture fullent/pcr-ceiling-ramp uses paced HTTP replay
+(the file-open probe absorbs the ramp, masking the bug — same non-seekable
+requirement as the 0028 HLS fixture) + a new displayed-pictures assertion.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Co-Authored-By: Happy <yesreply@happy.engineering>
+---
+ modules/demux/mpeg/ts.c                 | 26 ++++++++++++++++++-------
+ modules/demux/mpeg/ts_streams.c         |  1 +
+ modules/demux/mpeg/ts_streams_private.h |  6 ++++++
+ 3 files changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/modules/demux/mpeg/ts.c b/modules/demux/mpeg/ts.c
+index 26058bd4a5..afa2c8aa23 100644
+--- a/modules/demux/mpeg/ts.c
++++ b/modules/demux/mpeg/ts.c
+@@ -71,6 +71,9 @@
+  * accepts after N so a genuine long forward splice isn't blocked forever. */
+ #define SKYWAVE_TS_MAX_PCR_JUMP_FWD  VLC_TICK_FROM_SEC(60)
+ #define SKYWAVE_TS_MAX_REJECT_STREAK 10
++/* Max LEADING near-max PCRs dropped at open before latching a reference (the
++ * ceiling-garbage RAMP some transcoders emit — observed 9; 16 leaves margin). */
++#define SKYWAVE_TS_FIRSTPCR_MAX_DROPS 16
+ 
+ /*****************************************************************************
+  * Module descriptor
+@@ -2477,18 +2480,27 @@ static void PCRHandle( demux_t *p_demux, ts_pid_t *pid, ts_90khz_t i_pcr )
+          * which composes fatally with :adaptive-ts-force-playlist on HLS (the es_out
+          * forced-rebuffer wedge, hls-investigation-log Iteration S). A LEGITIMATE
+          * stream lands this close to the wrap point with ~1/3000 odds and then keeps
+-         * emitting near-max PCRs (it wraps within seconds) — so: drop a near-max
+-         * FIRST sample once; if the NEXT sample is also near-max (a genuine
+-         * about-to-wrap stream), it latches normally, costing one harmless sample. */
++         * emitting near-max PCRs (it wraps within seconds) — so keep dropping the
++         * LEADING near-max PCRs until the real timeline arrives, capped so a genuine
++         * about-to-wrap open (astronomically rare, and self-healing on its own wrap)
++         * isn't blocked forever. REFINED 2026-07-14 (final sweep): the garbage isn't a
++         * single spike but a RAMP — fullent loop channels emit ~9 ceiling PCRs
++         * (95443.0 -> 95443.7 stepping ~0.1s) before resetting to 0. The earlier
++         * one-shot drop let the SECOND ramp sample latch pcr.i_first=95443s; the
++         * broken-stream pcroffset then computed +95443s from that (leaked via the PES
++         * gather's i_append_pcr) and pushed VIDEO 26h into the future — frozen video,
++         * playing audio, 20+ fullent channels. Cap 16 comfortably covers the observed
++         * 9-ramp. */
+         if( b_is_program_pcr
+          && p_pmt->pcr.i_current == VLC_TICK_INVALID
+          && p_pmt->pcr.i_first == VLC_TICK_INVALID
+-         && p_pmt->pcr.skywave_pcr_reject_streak == 0
++         && p_pmt->pcr.skywave_firstpcr_drops < SKYWAVE_TS_FIRSTPCR_MAX_DROPS
+          && i_pcr > (ts_90khz_t)0x1FFFFFFFF - 30 * 90000 )
+         {
+-            msg_Warn( p_demux, "skywave-ts-pcr-spike: dropping near-max FIRST PCR "
+-                      "%"PRId64" (33-bit ceiling garbage)", (int64_t)i_pcr );
+-            p_pmt->pcr.skywave_pcr_reject_streak++;
++            if( p_pmt->pcr.skywave_firstpcr_drops == 0 )
++                msg_Warn( p_demux, "skywave-ts-pcr-spike: dropping near-max FIRST PCR "
++                          "%"PRId64" (33-bit ceiling garbage)", (int64_t)i_pcr );
++            p_pmt->pcr.skywave_firstpcr_drops++;
+             continue;
+         }
+ 
+diff --git a/modules/demux/mpeg/ts_streams.c b/modules/demux/mpeg/ts_streams.c
+index 5f8a938e72..ea18cc8fff 100644
+--- a/modules/demux/mpeg/ts_streams.c
++++ b/modules/demux/mpeg/ts_streams.c
+@@ -117,6 +117,7 @@ ts_pmt_t *ts_pmt_New( demux_t *p_demux )
+     pmt->pcr.i_first_dts = VLC_TICK_INVALID;
+     pmt->pcr.i_pcroffset = -1;
+     pmt->pcr.skywave_pcr_reject_streak = 0;
++    pmt->pcr.skywave_firstpcr_drops = 0;
+ 
+     pmt->pcr.b_fix_done = false;
+ 
+diff --git a/modules/demux/mpeg/ts_streams_private.h b/modules/demux/mpeg/ts_streams_private.h
+index e92133d1d2..391fad5b18 100644
+--- a/modules/demux/mpeg/ts_streams_private.h
++++ b/modules/demux/mpeg/ts_streams_private.h
+@@ -70,6 +70,12 @@ struct ts_pmt_t
+          * garbage-spike guard in PCRHandle (a single spurious near-33-bit-max
+          * PCR that would otherwise poison i_current's wrap reference). */
+         unsigned skywave_pcr_reject_streak;
++        /* Skywave: consecutive near-33-bit-max PCRs dropped at OPEN before the
++         * first real reference latches (a leading RAMP of ceiling-garbage PCRs —
++         * fullent loop channels emit ~9 before resetting to the real timeline).
++         * Separate from skywave_pcr_reject_streak so the mid-stream forward guard
++         * starts clean. */
++        unsigned skywave_firstpcr_drops;
+     } pcr;
+ 
+     struct
+-- 
+2.43.0
+
