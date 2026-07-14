@@ -1,4 +1,4 @@
-From 2f8d0ef92ed5fb746455007e158bca38bdc59e00 Mon Sep 17 00:00:00 2001
+From 2046694f051eca4e9a01de786e8da52b6d95fc48 Mon Sep 17 00:00:00 2001
 From: jdistler <josephcd921@gmail.com>
 Date: Tue, 14 Jul 2026 02:00:16 -0500
 Subject: [PATCH] demux: ts: drop the whole leading near-max-PCR ramp at open,
@@ -20,9 +20,13 @@ computed +95443s and pushed VIDEO 26h into the future — held by the vout
 forever while audio (exempt by 0027) played on.
 
 Keep dropping the leading near-max PCRs until the real timeline arrives, capped
-at SKYWAVE_TS_FIRSTPCR_MAX_DROPS (16, comfortably over the observed 9-ramp) so
-a genuine about-to-wrap open (astronomically rare, and self-healing on its own
-wrap) isn't blocked forever. Dedicated counter skywave_firstpcr_drops so the
+at SKYWAVE_TS_FIRSTPCR_MAX_DROPS. The cap is POPULATION-MEASURED: the audit
+scanned 120 flagged captures and found ramps up to 18 samples (not the 9 first
+observed), so the cap is 64 (>3x margin). Whether a partially-dropped ramp
+freezes depends on PES interleaving luck (garbage latching BEFORE the first
+dated PES wraps everything coherently; latching between PES datings splits the
+eras) — dropping the whole ramp removes the luck. A genuine about-to-wrap open
+(astronomically rare, and self-healing on its own wrap) isn't blocked forever. Dedicated counter skywave_firstpcr_drops so the
 mid-stream forward-spike guard's streak stays clean. Verified live on the
 affected channels (frozen-at-85 -> 676 pictures and climbing, zero bogus
 delay); regression fixture fullent/pcr-ceiling-ramp uses paced HTTP replay
@@ -32,26 +36,32 @@ requirement as the 0028 HLS fixture) + a new displayed-pictures assertion.
 Co-Authored-By: Claude <noreply@anthropic.com>
 Co-Authored-By: Happy <yesreply@happy.engineering>
 ---
- modules/demux/mpeg/ts.c                 | 26 ++++++++++++++++++-------
+ modules/demux/mpeg/ts.c                 | 32 +++++++++++++++++++------
  modules/demux/mpeg/ts_streams.c         |  1 +
- modules/demux/mpeg/ts_streams_private.h |  6 ++++++
- 3 files changed, 26 insertions(+), 7 deletions(-)
+ modules/demux/mpeg/ts_streams_private.h |  6 +++++
+ 3 files changed, 32 insertions(+), 7 deletions(-)
 
 diff --git a/modules/demux/mpeg/ts.c b/modules/demux/mpeg/ts.c
-index 26058bd4a5..afa2c8aa23 100644
+index 26058bd4a5..f2f263a7ef 100644
 --- a/modules/demux/mpeg/ts.c
 +++ b/modules/demux/mpeg/ts.c
-@@ -71,6 +71,9 @@
+@@ -71,6 +71,15 @@
   * accepts after N so a genuine long forward splice isn't blocked forever. */
  #define SKYWAVE_TS_MAX_PCR_JUMP_FWD  VLC_TICK_FROM_SEC(60)
  #define SKYWAVE_TS_MAX_REJECT_STREAK 10
 +/* Max LEADING near-max PCRs dropped at open before latching a reference (the
-+ * ceiling-garbage RAMP some transcoders emit — observed 9; 16 leaves margin). */
-+#define SKYWAVE_TS_FIRSTPCR_MAX_DROPS 16
++ * ceiling-garbage RAMP some transcoders emit). Population-measured across 120
++ * flagged captures: ramps run up to 18 samples (fullent 290425/28668), so 16 was
++ * NOT enough — an 18-ramp channel latched garbage at sample 17 and froze anyway
++ * (caught by the 2026-07-14 patch audit). 64 gives >3x margin over the observed
++ * max; a genuine about-to-wrap stream pays at most 64 dropped references
++ * (~seconds) before latching near-max legitimately, and a stream emitting ONLY
++ * ceiling garbage forever degrades to pre-guard behavior — no worse. */
++#define SKYWAVE_TS_FIRSTPCR_MAX_DROPS 64
  
  /*****************************************************************************
   * Module descriptor
-@@ -2477,18 +2480,27 @@ static void PCRHandle( demux_t *p_demux, ts_pid_t *pid, ts_90khz_t i_pcr )
+@@ -2477,18 +2486,27 @@ static void PCRHandle( demux_t *p_demux, ts_pid_t *pid, ts_90khz_t i_pcr )
           * which composes fatally with :adaptive-ts-force-playlist on HLS (the es_out
           * forced-rebuffer wedge, hls-investigation-log Iteration S). A LEGITIMATE
           * stream lands this close to the wrap point with ~1/3000 odds and then keeps
@@ -67,8 +77,8 @@ index 26058bd4a5..afa2c8aa23 100644
 +         * one-shot drop let the SECOND ramp sample latch pcr.i_first=95443s; the
 +         * broken-stream pcroffset then computed +95443s from that (leaked via the PES
 +         * gather's i_append_pcr) and pushed VIDEO 26h into the future — frozen video,
-+         * playing audio, 20+ fullent channels. Cap 16 comfortably covers the observed
-+         * 9-ramp. */
++         * playing audio, 20+ fullent channels. Cap: see
++         * SKYWAVE_TS_FIRSTPCR_MAX_DROPS (population-measured, 64). */
          if( b_is_program_pcr
           && p_pmt->pcr.i_current == VLC_TICK_INVALID
           && p_pmt->pcr.i_first == VLC_TICK_INVALID
